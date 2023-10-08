@@ -15,6 +15,20 @@
 package tmpfs
 
 // afterLoad is called by stateify.
-func (rf *regularFile) afterLoad() {
-	rf.memFile = rf.inode.fs.mfp.MemoryFile()
+func (fs *filesystem) afterLoad() {
+	if fs.privateMF {
+		// TODO(b/271612187): Add S/R support.
+		panic("S/R not supported for private memory files")
+	}
+	fs.mf = fs.mfp.MemoryFile()
+}
+
+// saveParent is called by stateify.
+func (d *dentry) saveParent() *dentry {
+	return d.parent.Load()
+}
+
+// saveParent is called by stateify.
+func (d *dentry) loadParent(parent *dentry) {
+	d.parent.Store(parent)
 }

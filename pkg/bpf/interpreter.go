@@ -16,8 +16,6 @@ package bpf
 
 import (
 	"fmt"
-
-	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
 // Possible values for ProgramError.Code.
@@ -91,7 +89,7 @@ func (e Error) Error() string {
 //
 // +stateify savable
 type Program struct {
-	instructions []linux.BPFInstruction
+	instructions []Instruction
 }
 
 // Length returns the number of instructions in the program.
@@ -99,9 +97,9 @@ func (p Program) Length() int {
 	return len(p.instructions)
 }
 
-// Compile performs validation on a sequence of BPF instructions before
-// wrapping them in a Program.
-func Compile(insns []linux.BPFInstruction) (Program, error) {
+// Compile performs validation and optimization on a sequence of BPF
+// instructions before wrapping them in a Program.
+func Compile(insns []Instruction) (Program, error) {
 	if len(insns) == 0 || len(insns) > MaxInstructions {
 		return Program{}, Error{InvalidInstructionCount, len(insns)}
 	}
@@ -216,7 +214,7 @@ func Compile(insns []linux.BPFInstruction) (Program, error) {
 		}
 	}
 
-	return Program{insns}, nil
+	return Program{Optimize(insns)}, nil
 }
 
 // Input represents a source of input data for a BPF program. (BPF
@@ -225,15 +223,15 @@ func Compile(insns []linux.BPFInstruction) (Program, error) {
 //
 // For all of Input's Load methods:
 //
-// - The second (bool) return value is true if the load succeeded and false
-// otherwise.
+//   - The second (bool) return value is true if the load succeeded and false
+//     otherwise.
 //
-// - Inputs should not assume that the loaded range falls within the input
-// data's length. Inputs should return false if the load falls outside of the
-// input data.
+//   - Inputs should not assume that the loaded range falls within the input
+//     data's length. Inputs should return false if the load falls outside of the
+//     input data.
 //
-// - Inputs should not assume that the offset is correctly aligned. Inputs may
-// choose to service or reject loads to unaligned addresses.
+//   - Inputs should not assume that the offset is correctly aligned. Inputs may
+//     choose to service or reject loads to unaligned addresses.
 type Input interface {
 	// Load32 reads 32 bits from the input starting at the given byte offset.
 	Load32(off uint32) (uint32, bool)
@@ -255,7 +253,7 @@ type machine struct {
 	M [ScratchMemRegisters]uint32
 }
 
-func conditionalJumpOffset(insn linux.BPFInstruction, cond bool) int {
+func conditionalJumpOffset(insn Instruction, cond bool) int {
 	if cond {
 		return int(insn.JumpIfTrue)
 	}

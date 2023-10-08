@@ -101,7 +101,11 @@ func (fs *filesystem) StateFields() []string {
 		"vfsfs",
 		"opts",
 		"creds",
-		"privateDevMinors",
+		"dirDevMinor",
+		"lowerDevMinors",
+		"dirInoCache",
+		"lastDirIno",
+		"maxFilenameLen",
 	}
 }
 
@@ -113,7 +117,11 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &fs.vfsfs)
 	stateSinkObject.Save(1, &fs.opts)
 	stateSinkObject.Save(2, &fs.creds)
-	stateSinkObject.Save(3, &fs.privateDevMinors)
+	stateSinkObject.Save(3, &fs.dirDevMinor)
+	stateSinkObject.Save(4, &fs.lowerDevMinors)
+	stateSinkObject.Save(5, &fs.dirInoCache)
+	stateSinkObject.Save(6, &fs.lastDirIno)
+	stateSinkObject.Save(7, &fs.maxFilenameLen)
 }
 
 func (fs *filesystem) afterLoad() {}
@@ -123,7 +131,11 @@ func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fs.vfsfs)
 	stateSourceObject.Load(1, &fs.opts)
 	stateSourceObject.Load(2, &fs.creds)
-	stateSourceObject.Load(3, &fs.privateDevMinors)
+	stateSourceObject.Load(3, &fs.dirDevMinor)
+	stateSourceObject.Load(4, &fs.lowerDevMinors)
+	stateSourceObject.Load(5, &fs.dirInoCache)
+	stateSourceObject.Load(6, &fs.lastDirIno)
+	stateSourceObject.Load(7, &fs.maxFilenameLen)
 }
 
 func (l *layerDevNumber) StateTypeName() string {
@@ -152,6 +164,34 @@ func (l *layerDevNumber) afterLoad() {}
 func (l *layerDevNumber) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.major)
 	stateSourceObject.Load(1, &l.minor)
+}
+
+func (l *layerDevNoAndIno) StateTypeName() string {
+	return "pkg/sentry/fsimpl/overlay.layerDevNoAndIno"
+}
+
+func (l *layerDevNoAndIno) StateFields() []string {
+	return []string{
+		"layerDevNumber",
+		"ino",
+	}
+}
+
+func (l *layerDevNoAndIno) beforeSave() {}
+
+// +checklocksignore
+func (l *layerDevNoAndIno) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.layerDevNumber)
+	stateSinkObject.Save(1, &l.ino)
+}
+
+func (l *layerDevNoAndIno) afterLoad() {}
+
+// +checklocksignore
+func (l *layerDevNoAndIno) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.layerDevNumber)
+	stateSourceObject.Load(1, &l.ino)
 }
 
 func (d *dentry) StateTypeName() string {
@@ -190,6 +230,9 @@ func (d *dentry) beforeSave() {}
 // +checklocksignore
 func (d *dentry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
+	var parentValue *dentry
+	parentValue = d.saveParent()
+	stateSinkObject.SaveValue(7, parentValue)
 	stateSinkObject.Save(0, &d.vfsd)
 	stateSinkObject.Save(1, &d.refs)
 	stateSinkObject.Save(2, &d.fs)
@@ -197,7 +240,6 @@ func (d *dentry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &d.uid)
 	stateSinkObject.Save(5, &d.gid)
 	stateSinkObject.Save(6, &d.copiedUp)
-	stateSinkObject.Save(7, &d.parent)
 	stateSinkObject.Save(8, &d.name)
 	stateSinkObject.Save(9, &d.children)
 	stateSinkObject.Save(10, &d.dirents)
@@ -223,7 +265,6 @@ func (d *dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &d.uid)
 	stateSourceObject.Load(5, &d.gid)
 	stateSourceObject.Load(6, &d.copiedUp)
-	stateSourceObject.Load(7, &d.parent)
 	stateSourceObject.Load(8, &d.name)
 	stateSourceObject.Load(9, &d.children)
 	stateSourceObject.Load(10, &d.dirents)
@@ -238,6 +279,7 @@ func (d *dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(19, &d.isMappable)
 	stateSourceObject.Load(20, &d.locks)
 	stateSourceObject.Load(21, &d.watches)
+	stateSourceObject.LoadValue(7, new(*dentry), func(y any) { d.loadParent(y.(*dentry)) })
 	stateSourceObject.AfterLoad(d.afterLoad)
 }
 
@@ -312,6 +354,7 @@ func init() {
 	state.Register((*FilesystemOptions)(nil))
 	state.Register((*filesystem)(nil))
 	state.Register((*layerDevNumber)(nil))
+	state.Register((*layerDevNoAndIno)(nil))
 	state.Register((*dentry)(nil))
 	state.Register((*fileDescription)(nil))
 	state.Register((*regularFileFD)(nil))

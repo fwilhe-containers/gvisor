@@ -68,7 +68,6 @@ func (n *nfNATTarget) UnmarshalUnsafe(src []byte) []byte {
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-//go:nosplit
 func (n *nfNATTarget) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     if !n.Range.Packed() && n.Target.Packed() {
         // Type nfNATTarget doesn't have a packed layout in memory, fall back to MarshalBytes.
@@ -92,18 +91,16 @@ func (n *nfNATTarget) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-//go:nosplit
 func (n *nfNATTarget) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     return n.CopyOutN(cc, addr, n.SizeBytes())
 }
 
-// CopyIn implements marshal.Marshallable.CopyIn.
-//go:nosplit
-func (n *nfNATTarget) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+// CopyInN implements marshal.Marshallable.CopyInN.
+func (n *nfNATTarget) CopyInN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     if !n.Range.Packed() && n.Target.Packed() {
         // Type nfNATTarget doesn't have a packed layout in memory, fall back to UnmarshalBytes.
         buf := cc.CopyScratchBuffer(n.SizeBytes()) // escapes: okay.
-        length, err := cc.CopyInBytes(addr, buf) // escapes: okay.
+        length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
         // Unmarshal unconditionally. If we had a short copy-in, this results in a
         // partially unmarshalled struct.
         n.UnmarshalBytes(buf) // escapes: fallback.
@@ -117,11 +114,16 @@ func (n *nfNATTarget) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, e
     hdr.Len = n.SizeBytes()
     hdr.Cap = n.SizeBytes()
 
-    length, err := cc.CopyInBytes(addr, buf) // escapes: okay.
+    length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
     // Since we bypassed the compiler's escape analysis, indicate that n
     // must live until the use above.
     runtime.KeepAlive(n) // escapes: replaced by intrinsic.
     return length, err
+}
+
+// CopyIn implements marshal.Marshallable.CopyIn.
+func (n *nfNATTarget) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+    return n.CopyInN(cc, addr, n.SizeBytes())
 }
 
 // WriteTo implements io.WriterTo.WriteTo.

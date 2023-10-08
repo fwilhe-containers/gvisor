@@ -21,10 +21,11 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 )
 
 // SetFilter installs the given BPF program.
-func SetFilter(instrs []linux.BPFInstruction) error {
+func SetFilter(instrs []bpf.Instruction) error {
 	// PR_SET_NO_NEW_PRIVS is required in order to enable seccomp. See
 	// seccomp(2) for details.
 	//
@@ -59,21 +60,21 @@ func SetFilter(instrs []linux.BPFInstruction) error {
 
 // SetFilterInChild is equivalent to SetFilter, but:
 //
-// - It is safe to call after runtime.syscall_runtime_AfterForkInChild.
+//   - It is safe to call after runtime.syscall_runtime_AfterForkInChild.
 //
-// - It requires that the calling goroutine cannot be moved to another thread,
-// which either requires that runtime.LockOSThread() is in effect or that the
-// caller is in fact in a fork()ed child process.
+//   - It requires that the calling goroutine cannot be moved to another thread,
+//     which either requires that runtime.LockOSThread() is in effect or that the
+//     caller is in fact in a fork()ed child process.
 //
-// - Since fork()ed child processes cannot perform heap allocation, it returns
-// a unix.Errno rather than an error.
+//   - Since fork()ed child processes cannot perform heap allocation, it returns
+//     a unix.Errno rather than an error.
 //
-// - The race instrumentation has to be disabled for all functions that are
-// called in a forked child.
+//   - The race instrumentation has to be disabled for all functions that are
+//     called in a forked child.
 //
 //go:norace
 //go:nosplit
-func SetFilterInChild(instrs []linux.BPFInstruction) unix.Errno {
+func SetFilterInChild(instrs []bpf.Instruction) unix.Errno {
 	if _, _, errno := unix.RawSyscall6(unix.SYS_PRCTL, linux.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0); errno != 0 {
 		return errno
 	}

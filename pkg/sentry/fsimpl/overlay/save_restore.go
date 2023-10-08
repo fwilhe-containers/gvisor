@@ -15,13 +15,21 @@
 package overlay
 
 import (
-	"sync/atomic"
-
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 )
 
 func (d *dentry) afterLoad() {
-	if atomic.LoadInt64(&d.refs) != -1 {
-		refsvfs2.Register(d)
+	if d.refs.Load() != -1 {
+		refs.Register(d)
 	}
+}
+
+// saveParent is called by stateify.
+func (d *dentry) saveParent() *dentry {
+	return d.parent.Load()
+}
+
+// loadParent is called by stateify.
+func (d *dentry) loadParent(parent *dentry) {
+	d.parent.Store(parent)
 }
