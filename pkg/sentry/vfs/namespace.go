@@ -188,6 +188,9 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 	newns.root = newRoot
 	newns.root.ns = newns
 	vfs.commitChildren(ctx, newRoot)
+	if ns.Owner != newns.Owner {
+		vfs.lockMountTree(newRoot)
+	}
 	return newns, nil
 }
 
@@ -195,11 +198,9 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 func (mntns *MountNamespace) Destroy(ctx context.Context) {
 	vfs := mntns.root.fs.VirtualFilesystem()
 	vfs.lockMounts()
-	vfs.mounts.seq.BeginWrite()
-	vfs.umountRecursiveLocked(mntns.root, &umountRecursiveOptions{
+	vfs.umountTreeLocked(mntns.root, &umountRecursiveOptions{
 		disconnectHierarchy: true,
 	})
-	vfs.mounts.seq.EndWrite()
 	vfs.unlockMounts(ctx)
 }
 

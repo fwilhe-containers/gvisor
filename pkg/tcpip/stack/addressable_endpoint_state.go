@@ -434,7 +434,7 @@ func (a *AddressableEndpointState) MainAddress() tcpip.AddressWithPrefix {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	ep := a.acquirePrimaryAddressRLocked(tcpip.Address{}, func(ep *addressState) bool {
+	ep := a.acquirePrimaryAddressRLocked(tcpip.Address{}, tcpip.Address{} /* srcHint */, func(ep *addressState) bool {
 		switch kind := ep.GetKind(); kind {
 		case Permanent:
 			return a.networkEndpoint.Enabled() || !a.options.HiddenWhileDisabled
@@ -462,7 +462,7 @@ func (a *AddressableEndpointState) MainAddress() tcpip.AddressWithPrefix {
 // valid according to isValid.
 //
 // +checklocksread:a.mu
-func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr tcpip.Address, isValid func(*addressState) bool) *addressState {
+func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr, srcHint tcpip.Address, isValid func(*addressState) bool) *addressState {
 	// TODO: Move this out into IPv4-specific code.
 	// IPv6 handles source IP selection elsewhere. We have to do source
 	// selection only for IPv4, in which case ep is never deprecated. Thus
@@ -474,16 +474,20 @@ func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr tcpip
 			if !isValid(state) {
 				continue
 			}
+			// Source hint takes precedent over prefix matching.
+			if state.addr.Address == srcHint && srcHint != (tcpip.Address{}) {
+				best = state
+				break
+			}
 			stateLen := state.addr.Address.MatchingPrefix(remoteAddr)
 			if best == nil || bestLen < stateLen {
 				best = state
 				bestLen = stateLen
 			}
 		}
-		if best != nil {
-			best.IncRef()
+		if best != nil && best.TryIncRef() {
+			return best
 		}
-		return best
 	}
 
 	var deprecatedEndpoint *addressState
@@ -493,7 +497,7 @@ func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr tcpip
 		}
 
 		if !ep.Deprecated() {
-			if ep.IncRef() {
+			if ep.TryIncRef() {
 				// ep is not deprecated, so return it immediately.
 				//
 				// If we kept track of a deprecated endpoint, decrement its reference
@@ -510,7 +514,7 @@ func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr tcpip
 
 				return ep
 			}
-		} else if deprecatedEndpoint == nil && ep.IncRef() {
+		} else if deprecatedEndpoint == nil && ep.TryIncRef() {
 			// We prefer an endpoint that is not deprecated, but we keep track of
 			// ep in case a doesn't have any non-deprecated endpoints.
 			//
@@ -533,16 +537,20 @@ func (a *AddressableEndpointState) acquirePrimaryAddressRLocked(remoteAddr tcpip
 // If there is no matching address, a temporary address will be returned if
 // allowTemp is true.
 //
+// If readOnly is true, the address will be returned without an extra reference.
+// In this case it is not safe to modify the endpoint, only read attributes like
+// subnet.
+//
 // Regardless how the address was obtained, it will be acquired before it is
 // returned.
-func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tcpip.Address, f func(AddressEndpoint) bool, allowTemp bool, tempPEB PrimaryEndpointBehavior) AddressEndpoint {
+func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tcpip.Address, f func(AddressEndpoint) bool, allowTemp bool, tempPEB PrimaryEndpointBehavior, readOnly bool) AddressEndpoint {
 	lookup := func() *addressState {
 		if addrState, ok := a.endpoints[localAddr]; ok {
 			if !addrState.IsAssigned(allowTemp) {
 				return nil
 			}
 
-			if !addrState.IncRef() {
+			if !readOnly && !addrState.TryIncRef() {
 				panic(fmt.Sprintf("failed to increase the reference count for address = %s", addrState.addr))
 			}
 
@@ -551,7 +559,10 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 
 		if f != nil {
 			for _, addrState := range a.endpoints {
-				if addrState.IsAssigned(allowTemp) && f(addrState) && addrState.IncRef() {
+				if addrState.IsAssigned(allowTemp) && f(addrState) {
+					if !readOnly && !addrState.TryIncRef() {
+						continue
+					}
 					return addrState
 				}
 			}
@@ -610,20 +621,30 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 	if ep == nil {
 		return nil
 	}
+	if readOnly {
+		if ep.addressableEndpointState == a {
+			// Checklocks doesn't understand that we are logically guaranteed to have
+			// ep.mu locked already. We need to use checklocksignore to appease the
+			// analyzer.
+			ep.addressableEndpointState.decAddressRefLocked(ep) // +checklocksignore
+		} else {
+			ep.DecRef()
+		}
+	}
 	return ep
 }
 
 // AcquireAssignedAddress implements AddressableEndpoint.
-func (a *AddressableEndpointState) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB PrimaryEndpointBehavior) AddressEndpoint {
-	return a.AcquireAssignedAddressOrMatching(localAddr, nil, allowTemp, tempPEB)
+func (a *AddressableEndpointState) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB PrimaryEndpointBehavior, readOnly bool) AddressEndpoint {
+	return a.AcquireAssignedAddressOrMatching(localAddr, nil, allowTemp, tempPEB, readOnly)
 }
 
 // AcquireOutgoingPrimaryAddress implements AddressableEndpoint.
-func (a *AddressableEndpointState) AcquireOutgoingPrimaryAddress(remoteAddr tcpip.Address, allowExpired bool) AddressEndpoint {
+func (a *AddressableEndpointState) AcquireOutgoingPrimaryAddress(remoteAddr tcpip.Address, srcHint tcpip.Address, allowExpired bool) AddressEndpoint {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	ep := a.acquirePrimaryAddressRLocked(remoteAddr, func(ep *addressState) bool {
+	ep := a.acquirePrimaryAddressRLocked(remoteAddr, srcHint, func(ep *addressState) bool {
 		return ep.IsAssigned(allowExpired)
 	})
 
@@ -806,7 +827,7 @@ func (a *addressState) IsAssigned(allowExpired bool) bool {
 }
 
 // IncRef implements AddressEndpoint.
-func (a *addressState) IncRef() bool {
+func (a *addressState) TryIncRef() bool {
 	return a.refs.TryIncRef()
 }
 

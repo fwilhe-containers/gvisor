@@ -121,7 +121,7 @@ type MemoryFile struct {
 	// file blocks expected. This is used to elide the scan when this
 	// matches the underlying file blocks.
 	//
-	// To track swapped pages, usageSwapped tracks the discrepency between
+	// To track swapped pages, usageSwapped tracks the discrepancy between
 	// what is observed in core and what is reported by the file. When
 	// usageSwapped is non-zero, a sweep will be performed at least every
 	// second. The start of the last sweep is recorded in usageLast.
@@ -153,7 +153,7 @@ type MemoryFile struct {
 	// operations. This allows MemoryFile.MapInternal to avoid locking in the
 	// common case where chunk mappings already exist.
 	mappingsMu mappingsMutex
-	mappings   atomic.Value
+	mappings   atomic.Pointer[[]uintptr]
 
 	// destroyed is set by Destroy to instruct the reclaimer goroutine to
 	// release resources and exit. destroyed is protected by mu.
@@ -183,6 +183,10 @@ type MemoryFile struct {
 	// notifications used to drive eviction. stopNotifyPressure is
 	// immutable.
 	stopNotifyPressure func()
+
+	// savable is true if this MemoryFile will be saved via SaveTo() during
+	// the kernel's SaveTo operation. savable is protected by mu.
+	savable bool
 }
 
 // MemoryFileOpts provides options to NewMemoryFile.
@@ -212,6 +216,10 @@ type MemoryFileOpts struct {
 
 	// DiskBackedFile indicates that the MemoryFile is backed by a file on disk.
 	DiskBackedFile bool
+
+	// RestoreID is an opaque string used to reassociate the MemoryFile with its
+	// replacement during restore.
+	RestoreID string
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -347,7 +355,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		file:      file,
 		evictable: make(map[EvictableMemoryUser]*evictableMemoryUserInfo),
 	}
-	f.mappings.Store(make([]uintptr, 0))
+	f.mappings.Store(&[]uintptr{})
 	f.reclaimCond.L = &f.mu
 
 	if f.opts.DelayedEviction == DelayedEvictionEnabled && f.opts.UseHostMemcgPressure {
@@ -461,12 +469,12 @@ type AllocOpts struct {
 	// that will fill the allocated memory by invoking host system calls should
 	// pass AllocateOnly.
 	Mode AllocationMode
-	// If Reader is provided, the allocated memory is filled by calling
-	// ReadToBlocks() repeatedly until either length bytes are read or a non-nil
-	// error is returned. It returns the allocated memory, truncated down to the
-	// nearest page. If this is shorter than length bytes due to an error
-	// returned by ReadToBlocks(), it returns the partially filled fr and error.
-	Reader safemem.Reader
+	// If ReaderFunc is provided, the allocated memory is filled by calling it
+	// repeatedly until either length bytes are read or a non-nil error is
+	// returned. It returns the allocated memory, truncated down to the nearest
+	// page. If this is shorter than length bytes due to an error returned by
+	// ReaderFunc, it returns the partially filled fr and error.
+	ReaderFunc safemem.ReaderFunc
 }
 
 // Allocate returns a range of initially-zeroed pages of the given length with
@@ -510,7 +518,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 	default:
 		panic(fmt.Sprintf("unknown allocation mode: %d", opts.Mode))
 	}
-	if opts.Reader != nil {
+	if opts.ReaderFunc != nil {
 		if dsts.IsEmpty() {
 			dsts, err = f.MapInternal(fr, hostarch.Write)
 			if err != nil {
@@ -518,7 +526,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 				return memmap.FileRange{}, err
 			}
 		}
-		n, err := safemem.ReadFullToBlocks(opts.Reader, dsts)
+		n, err := safemem.ReadFullToBlocks(opts.ReaderFunc, dsts)
 		un := uint64(hostarch.Addr(n).RoundDown())
 		if un < length {
 			// Free unused memory and update fr to contain only the memory that is
@@ -563,10 +571,10 @@ func (f *MemoryFile) allocate(length uint64, opts *AllocOpts) (memmap.FileRange,
 		}
 		f.fileSize = newFileSize
 		f.mappingsMu.Lock()
-		oldMappings := f.mappings.Load().([]uintptr)
+		oldMappings := *f.mappings.Load()
 		newMappings := make([]uintptr, newFileSize>>chunkShift)
 		copy(newMappings, oldMappings)
-		f.mappings.Store(newMappings)
+		f.mappings.Store(&newMappings)
 		f.mappingsMu.Unlock()
 	}
 
@@ -576,13 +584,11 @@ func (f *MemoryFile) allocate(length uint64, opts *AllocOpts) (memmap.FileRange,
 		}
 	}
 	// Mark selected pages as in use.
-	if !f.usage.Add(fr, usageInfo{
+	f.usage.InsertRange(fr, usageInfo{
 		kind:    opts.Kind,
 		refs:    1,
 		memCgID: opts.MemCgID,
-	}) {
-		panic(fmt.Sprintf("allocating %v: failed to insert into usage set:\n%v", fr, &f.usage))
-	}
+	})
 
 	return fr, nil
 }
@@ -817,9 +823,7 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) error {
 
 func (f *MemoryFile) manuallyZero(fr memmap.FileRange) error {
 	return f.forEachMappingSlice(fr, func(bs []byte) {
-		for i := range bs {
-			bs[i] = 0
-		}
+		clear(bs)
 	})
 }
 
@@ -849,7 +853,7 @@ func (f *MemoryFile) markDecommitted(fr memmap.FileRange) {
 	defer f.mu.Unlock()
 	// Since we're changing the knownCommitted attribute, we need to merge
 	// across the entire range to ensure that the usage tree is minimal.
-	gap := f.usage.ApplyContiguous(fr, func(seg usageIterator) {
+	f.usage.MutateFullRange(fr, func(seg usageIterator) bool {
 		val := seg.ValuePtr()
 		if val.knownCommitted {
 			// Drop the usageExpected appropriately.
@@ -859,11 +863,28 @@ func (f *MemoryFile) markDecommitted(fr memmap.FileRange) {
 			val.knownCommitted = false
 		}
 		val.memCgID = 0
+		return true
 	})
-	if gap.Ok() {
-		panic(fmt.Sprintf("Decommit(%v): attempted to decommit unallocated pages %v:\n%v", fr, gap.Range(), &f.usage))
-	}
-	f.usage.MergeRange(fr)
+}
+
+// HasUniqueRef returns true if all pages in the given range have exactly one
+// reference. A return value of false is inherently racy, but if the caller
+// holds a reference on the given range and is preventing other goroutines from
+// copying it, then a return value of true is not racy.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) HasUniqueRef(fr memmap.FileRange) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hasUniqueRef := true
+	f.usage.VisitFullRange(fr, func(seg usageIterator) bool {
+		if seg.ValuePtr().refs != 1 {
+			hasUniqueRef = false
+			return false
+		}
+		return true
+	})
+	return hasUniqueRef
 }
 
 // IncRef implements memmap.File.IncRef.
@@ -875,14 +896,10 @@ func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	gap := f.usage.ApplyContiguous(fr, func(seg usageIterator) {
+	f.usage.MutateFullRange(fr, func(seg usageIterator) bool {
 		seg.ValuePtr().refs++
+		return true
 	})
-	if gap.Ok() {
-		panic(fmt.Sprintf("IncRef(%v): attempted to IncRef on unallocated pages %v:\n%v", fr, gap.Range(), &f.usage))
-	}
-
-	f.usage.MergeAdjacent(fr)
 }
 
 // DecRef implements memmap.File.DecRef.
@@ -896,15 +913,14 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for seg := f.usage.FindSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
-		seg = f.usage.Isolate(seg, fr)
+	f.usage.MutateFullRange(fr, func(seg usageIterator) bool {
 		val := seg.ValuePtr()
 		if val.refs == 0 {
 			panic(fmt.Sprintf("DecRef(%v): 0 existing references on %v:\n%v", fr, seg.Range(), &f.usage))
 		}
 		val.refs--
 		if val.refs == 0 {
-			f.reclaim.Add(seg.Range(), reclaimSetValue{})
+			f.reclaim.InsertRange(seg.Range(), reclaimSetValue{})
 			freed = true
 			// Reclassify memory as System, until it's freed by the reclaim
 			// goroutine.
@@ -913,8 +929,8 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 			}
 			val.kind = usage.System
 		}
-	}
-	f.usage.MergeAdjacent(fr)
+		return true
+	})
 
 	if freed {
 		f.reclaimable = true
@@ -950,7 +966,7 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 // forEachMappingSlice invokes fn on a sequence of byte slices that
 // collectively map all bytes in fr.
 func (f *MemoryFile) forEachMappingSlice(fr memmap.FileRange, fn func([]byte)) error {
-	mappings := f.mappings.Load().([]uintptr)
+	mappings := *f.mappings.Load()
 	for chunkStart := fr.Start &^ chunkMask; chunkStart < fr.End; chunkStart += chunkSize {
 		chunk := int(chunkStart >> chunkShift)
 		m := atomic.LoadUintptr(&mappings[chunk])
@@ -979,7 +995,7 @@ func (f *MemoryFile) getChunkMapping(chunk int) ([]uintptr, uintptr, error) {
 	defer f.mappingsMu.Unlock()
 	// Another thread may have replaced f.mappings altogether due to file
 	// expansion.
-	mappings := f.mappings.Load().([]uintptr)
+	mappings := *f.mappings.Load()
 	// Another thread may have already mapped the chunk.
 	if m := mappings[chunk]; m != 0 {
 		return mappings, m, nil
@@ -1088,10 +1104,10 @@ func (f *MemoryFile) ShouldCacheEvictable() bool {
 }
 
 // UpdateUsage ensures that the memory usage statistics in
-// usage.MemoryAccounting are up to date. If forceScan is true, the
-// UsageScanDuration is ignored and the memory file is scanned to get the
-// memory usage.
-func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
+// usage.MemoryAccounting are up to date. If memCgIDs is nil, all the pages
+// will be scanned. Else only the pages which belong to the memory cgroup ids
+// in memCgIDs will be scanned and the memory usage will be updated.
+func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -1120,10 +1136,10 @@ func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
 		return nil
 	}
 
-	if memCgID == 0 {
+	if memCgIDs == nil {
 		f.usageLast = time.Now()
 	}
-	err = f.updateUsageLocked(currentUsage, memCgID, mincore)
+	err = f.updateUsageLocked(currentUsage, memCgIDs, mincore)
 	log.Debugf("UpdateUsage: currentUsage=%d, usageExpected=%d, usageSwapped=%d.",
 		currentUsage, f.usageExpected, f.usageSwapped)
 	log.Debugf("UpdateUsage: took %v.", time.Since(f.usageLast))
@@ -1136,7 +1152,7 @@ func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
 //
 // Precondition: f.mu must be held; it may be unlocked and reacquired.
 // +checklocks:f.mu
-func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgID uint32, checkCommitted func(bs []byte, committed []byte) error) error {
+func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgIDs map[uint32]struct{}, checkCommitted func(bs []byte, committed []byte) error) error {
 	// Track if anything changed to elide the merge. In the common case, we
 	// expect all segments to be committed and no merge to occur.
 	changedAny := false
@@ -1183,10 +1199,12 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgID uint32, chec
 		// Scan the pages of the given memCgID only. This will avoid scanning the
 		// whole memory file when the memory usage is required only for a specific
 		// cgroup. The total memory usage of all cgroups can be obtained when the
-		// memCgID is passed as zero.
-		if memCgID != 0 && seg.ValuePtr().memCgID != memCgID {
-			seg = seg.NextSegment()
-			continue
+		// memCgIDs is nil.
+		if memCgIDs != nil {
+			if _, ok := memCgIDs[seg.ValuePtr().memCgID]; !ok {
+				seg = seg.NextSegment()
+				continue
+			}
 		}
 
 		// Get the range for this segment. As we touch slices, the
@@ -1381,7 +1399,7 @@ func (f *MemoryFile) runReclaim() {
 	f.file = nil
 	f.mappingsMu.Lock()
 	defer f.mappingsMu.Unlock()
-	mappings := f.mappings.Load().([]uintptr)
+	mappings := *f.mappings.Load()
 	for i, m := range mappings {
 		if m != 0 {
 			_, _, errno := unix.Syscall(unix.SYS_MUNMAP, m, chunkSize, 0)
@@ -1390,8 +1408,8 @@ func (f *MemoryFile) runReclaim() {
 			}
 		}
 	}
-	// Similarly, invalidate f.mappings. (atomic.Value.Store(nil) panics.)
-	f.mappings.Store([]uintptr{})
+	// Similarly, invalidate f.mappings
+	f.mappings.Store(nil)
 	f.mu.Unlock()
 
 	// This must be called without holding f.mu to avoid circular lock

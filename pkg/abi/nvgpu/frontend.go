@@ -26,13 +26,15 @@ const NV_IOCTL_MAGIC = uint32('F')
 // Note that these are only the IOC_NR part of the ioctl command.
 const (
 	// From kernel-open/common/inc/nv-ioctl-numbers.h:
-	NV_IOCTL_BASE            = 200
-	NV_ESC_CARD_INFO         = NV_IOCTL_BASE + 0
-	NV_ESC_REGISTER_FD       = NV_IOCTL_BASE + 1
-	NV_ESC_ALLOC_OS_EVENT    = NV_IOCTL_BASE + 6
-	NV_ESC_FREE_OS_EVENT     = NV_IOCTL_BASE + 7
-	NV_ESC_CHECK_VERSION_STR = NV_IOCTL_BASE + 10
-	NV_ESC_SYS_PARAMS        = NV_IOCTL_BASE + 14
+	NV_IOCTL_BASE             = 200
+	NV_ESC_CARD_INFO          = NV_IOCTL_BASE + 0
+	NV_ESC_REGISTER_FD        = NV_IOCTL_BASE + 1
+	NV_ESC_ALLOC_OS_EVENT     = NV_IOCTL_BASE + 6
+	NV_ESC_FREE_OS_EVENT      = NV_IOCTL_BASE + 7
+	NV_ESC_CHECK_VERSION_STR  = NV_IOCTL_BASE + 10
+	NV_ESC_ATTACH_GPUS_TO_FD  = NV_IOCTL_BASE + 12
+	NV_ESC_SYS_PARAMS         = NV_IOCTL_BASE + 14
+	NV_ESC_WAIT_OPEN_COMPLETE = NV_IOCTL_BASE + 18
 
 	// From kernel-open/common/inc/nv-ioctl-numa.h:
 	NV_ESC_NUMA_INFO = NV_IOCTL_BASE + 15
@@ -101,6 +103,15 @@ type IoctlSysParams struct {
 	MemblockSize uint64
 }
 
+// IoctlWaitOpenComplete is nv_ioctl_wait_open_complete_t, the parameter type
+// for NV_ESC_WAIT_OPEN_COMPLETE.
+//
+// +marshal
+type IoctlWaitOpenComplete struct {
+	Rc            int32
+	AdapterStatus uint32
+}
+
 // IoctlNVOS02ParametersWithFD is nv_ioctl_nvos2_parameters_with_fd, the
 // parameter type for NV_ESC_RM_ALLOC_MEMORY.
 //
@@ -116,7 +127,7 @@ type NVOS02Parameters struct {
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
-	HClass        uint32
+	HClass        ClassID
 	Flags         uint32
 	Pad0          [4]byte
 	PMemory       P64 // address of application mapping, without indirection
@@ -166,10 +177,10 @@ type NVOS21Parameters struct {
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
-	HClass        uint32
+	HClass        ClassID
 	PAllocParms   P64
+	ParamsSize    uint32
 	Status        uint32
-	Pad0          [4]byte
 }
 
 // GetPAllocParms implements RmAllocParamType.GetPAllocParms.
@@ -197,6 +208,7 @@ func (n *NVOS21Parameters) FromOS64(other NVOS64Parameters) {
 	n.HObjectNew = other.HObjectNew
 	n.HClass = other.HClass
 	n.PAllocParms = other.PAllocParms
+	n.ParamsSize = other.ParamsSize
 	n.Status = other.Status
 }
 
@@ -208,6 +220,7 @@ func (n *NVOS21Parameters) ToOS64() NVOS64Parameters {
 		HObjectNew:    n.HObjectNew,
 		HClass:        n.HClass,
 		PAllocParms:   n.PAllocParms,
+		ParamsSize:    n.ParamsSize,
 		Status:        n.Status,
 	}
 }
@@ -360,11 +373,13 @@ type NVOS64Parameters struct {
 	HRoot            Handle
 	HObjectParent    Handle
 	HObjectNew       Handle
-	HClass           uint32
+	HClass           ClassID
 	PAllocParms      P64
 	PRightsRequested P64
+	ParamsSize       uint32
 	Flags            uint32
 	Status           uint32
+	_                uint32
 }
 
 // GetPAllocParms implements RmAllocParamType.GetPAllocParms.
@@ -384,14 +399,10 @@ func (n *NVOS64Parameters) SetPAllocParms(p P64) { n.PAllocParms = p }
 func (n *NVOS64Parameters) SetPRightsRequested(p P64) { n.PRightsRequested = p }
 
 // FromOS64 implements RmAllocParamType.FromOS64.
-func (n *NVOS64Parameters) FromOS64(other NVOS64Parameters) {
-	*n = other
-}
+func (n *NVOS64Parameters) FromOS64(other NVOS64Parameters) { *n = other }
 
 // ToOS64 implements RmAllocParamType.ToOS64.
-func (n *NVOS64Parameters) ToOS64() NVOS64Parameters {
-	return *n
-}
+func (n *NVOS64Parameters) ToOS64() NVOS64Parameters { return *n }
 
 // Frontend ioctl parameter struct sizes.
 var (
@@ -400,6 +411,7 @@ var (
 	SizeofIoctlFreeOSEvent            = uint32((*IoctlFreeOSEvent)(nil).SizeBytes())
 	SizeofRMAPIVersion                = uint32((*RMAPIVersion)(nil).SizeBytes())
 	SizeofIoctlSysParams              = uint32((*IoctlSysParams)(nil).SizeBytes())
+	SizeofIoctlWaitOpenComplete       = uint32((*IoctlWaitOpenComplete)(nil).SizeBytes())
 	SizeofIoctlNVOS02ParametersWithFD = uint32((*IoctlNVOS02ParametersWithFD)(nil).SizeBytes())
 	SizeofNVOS00Parameters            = uint32((*NVOS00Parameters)(nil).SizeBytes())
 	SizeofNVOS21Parameters            = uint32((*NVOS21Parameters)(nil).SizeBytes())

@@ -24,7 +24,7 @@ import (
 // archSyscallFilters returns arch-specific syscalls made exclusively by the
 // KVM platform.
 func (k *KVM) archSyscallFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_ARCH_PRCTL: seccomp.Or{
 			seccomp.PerArg{
 				seccomp.EqualTo(linux.ARCH_GET_FS),
@@ -35,17 +35,26 @@ func (k *KVM) archSyscallFilters() seccomp.SyscallRules {
 		},
 		unix.SYS_IOCTL: seccomp.Or{
 			seccomp.PerArg{
-				seccomp.AnyValue{},
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(KVM_INTERRUPT),
 			},
 			seccomp.PerArg{
-				seccomp.AnyValue{},
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(KVM_NMI),
 			},
 			seccomp.PerArg{
-				seccomp.AnyValue{},
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(KVM_GET_REGS),
 			},
 		},
+	})
+}
+
+// hottestSyscalls returns the list of hot syscalls for the KVM platform.
+func hottestSyscalls() []uintptr {
+	return []uintptr{
+		unix.SYS_FUTEX,
+		unix.SYS_IOCTL,
+		unix.SYS_RT_SIGRETURN,
 	}
 }

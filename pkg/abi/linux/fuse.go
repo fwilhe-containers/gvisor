@@ -91,6 +91,7 @@ const (
 // FUSEHeaderIn is the header read by the daemon with each request.
 //
 // +marshal
+// +stateify savable
 type FUSEHeaderIn struct {
 	// Len specifies the total length of the data, including this header.
 	Len uint32
@@ -124,6 +125,7 @@ var SizeOfFUSEHeaderIn = uint32((*FUSEHeaderIn)(nil).SizeBytes())
 // reply; if they do not, this will be explicitly documented).
 //
 // +marshal
+// +stateify savable
 type FUSEHeaderOut struct {
 	// Len specifies the total length of the data, including this header.
 	Len uint32
@@ -139,7 +141,7 @@ type FUSEHeaderOut struct {
 var SizeOfFUSEHeaderOut = uint32((*FUSEHeaderOut)(nil).SizeBytes())
 
 // FUSE_INIT flags, consistent with the ones in include/uapi/linux/fuse.h.
-// Our taget version is 7.23 but we have few implemented in advance.
+// Our target version is 7.23 but we have few implemented in advance.
 const (
 	FUSE_ASYNC_READ       = 1 << 0
 	FUSE_POSIX_LOCKS      = 1 << 1
@@ -299,7 +301,7 @@ type FUSEGetAttrIn struct {
 	Fh uint64
 }
 
-// FUSEAttr is the struct used in the reponse FUSEGetAttrOut.
+// FUSEAttr is the struct used in the response FUSEGetAttrOut.
 //
 // +marshal
 type FUSEAttr struct {

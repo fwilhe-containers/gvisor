@@ -16,9 +16,10 @@
 package inet
 
 import (
-	"time"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -40,6 +41,9 @@ type Stack interface {
 	// AddInterfaceAddr adds an address to the network interface identified by
 	// idx.
 	AddInterfaceAddr(idx int32, addr InterfaceAddr) error
+
+	// SetInterface modifies or adds a new interface.
+	SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 
 	// RemoveInterfaceAddr removes an address from the network interface
 	// identified by idx.
@@ -84,8 +88,11 @@ type Stack interface {
 	// Pause pauses the network stack before save.
 	Pause()
 
-	// Resume restarts the network stack after restore.
+	// Resume resumes the network stack after save.
 	Resume()
+
+	// Restore restarts the network stack after restore.
+	Restore()
 
 	// Destroy the network stack.
 	Destroy()
@@ -110,12 +117,6 @@ type Stack interface {
 	// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
 	// (inclusive).
 	SetPortRange(start uint16, end uint16) error
-
-	// GROTimeout returns the GRO timeout.
-	GROTimeout(NICID int32) (time.Duration, error)
-
-	// GROTimeout sets the GRO timeout.
-	SetGROTimeout(NICID int32, timeout time.Duration) error
 }
 
 // Interface contains information about a network interface.

@@ -15,10 +15,12 @@
 package overlay
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/refs"
 )
 
-func (d *dentry) afterLoad() {
+func (d *dentry) afterLoad(context.Context) {
 	if d.refs.Load() != -1 {
 		refs.Register(d)
 	}
@@ -30,6 +32,6 @@ func (d *dentry) saveParent() *dentry {
 }
 
 // loadParent is called by stateify.
-func (d *dentry) loadParent(parent *dentry) {
+func (d *dentry) loadParent(_ context.Context, parent *dentry) {
 	d.parent.Store(parent)
 }

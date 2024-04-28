@@ -44,7 +44,7 @@ type sysmsgThread struct {
 	msg *sysmsg.Msg
 
 	// context is the last context that ran on this thread.
-	context *context
+	context *platformContext
 
 	// stackRange is a sysmsg stack in the memory file.
 	stackRange memmap.FileRange
@@ -97,13 +97,32 @@ func (p *sysmsgThread) Debugf(format string, v ...any) {
 	p.thread.Debugf(format+postfix, v...)
 }
 
+func sysmsgSyscallNotifyRules() []bpf.Instruction {
+	rules := []seccomp.RuleSet{
+		seccomp.RuleSet{
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+				unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
+			}),
+			Action: linux.SECCOMP_RET_USER_NOTIF,
+		},
+	}
+	instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+		DefaultAction: linux.SECCOMP_RET_ALLOW,
+		BadArchAction: linux.SECCOMP_RET_ALLOW,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("failed to build rules for sysmsg threads: %v", err))
+	}
+	return instrs
+}
+
 func sysmsgThreadRules(stubStart uintptr) []bpf.Instruction {
 	rules := []seccomp.RuleSet{}
 	rules = appendSysThreadArchSeccompRules(rules)
 	rules = append(rules, []seccomp.RuleSet{
 		// Allow instructions from the sysmsg code stub, which is limited by one page.
 		{
-			Rules: seccomp.SyscallRules{
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 				unix.SYS_FUTEX: seccomp.Or{
 					seccomp.PerArg{
 						seccomp.GreaterThan(stubStart),
@@ -142,11 +161,14 @@ func sysmsgThreadRules(stubStart uintptr) []bpf.Instruction {
 					seccomp.AnyValue{},
 					seccomp.GreaterThan(stubStart), // rip
 				},
-			},
+			}),
 			Action: linux.SECCOMP_RET_ALLOW,
 		},
 	}...)
-	instrs, err := seccomp.BuildProgram(rules, linux.SECCOMP_RET_TRAP, linux.SECCOMP_RET_TRAP)
+	instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+		DefaultAction: linux.SECCOMP_RET_TRAP,
+		BadArchAction: linux.SECCOMP_RET_TRAP,
+	})
 	if err != nil {
 		panic(fmt.Sprintf("failed to build rules for sysmsg threads: %v", err))
 	}

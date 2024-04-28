@@ -30,7 +30,7 @@
 // Reference Model:
 //
 // Kernfs dentries represents named pointers to inodes. Kernfs is solely
-// reponsible for maintaining and modifying its dentry tree; inode
+// responsible for maintaining and modifying its dentry tree; inode
 // implementations can not access the tree. Dentries and inodes have
 // independent lifetimes and reference counts. A child dentry unconditionally
 // holds a reference on its parent directory's dentry. A dentry also holds a
@@ -742,7 +742,7 @@ type inodeRefs interface {
 
 type inodeMetadata interface {
 	// CheckPermissions checks that creds may access this inode for the
-	// requested access type, per the the rules of
+	// requested access type, per the rules of
 	// fs/namei.c:generic_permission().
 	CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error
 

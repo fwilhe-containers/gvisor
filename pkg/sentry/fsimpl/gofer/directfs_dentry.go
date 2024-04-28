@@ -91,7 +91,8 @@ func (fs *filesystem) getDirectfsRootDentry(ctx context.Context, rootHostFD int,
 type directfsDentry struct {
 	dentry
 
-	// controlFD is the host FD to this file. controlFD is immutable.
+	// controlFD is the host FD to this file. controlFD is immutable until
+	// destruction, which is synchronized with dentry.handleMu.
 	controlFD int
 
 	// controlFDLisa is a lisafs control FD on this dentry.
@@ -401,9 +402,11 @@ func fchown(fd, uid, gid int) error {
 	return unix.Fchownat(fd, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
+// Precondition: d.handleMu must be locked.
 func (d *directfsDentry) destroy(ctx context.Context) {
 	if d.controlFD >= 0 {
 		_ = unix.Close(d.controlFD)
+		d.controlFD = -1
 	}
 	if d.controlFDLisa.Ok() {
 		d.controlFDLisa.Close(ctx, true /* flush */)
@@ -418,6 +421,14 @@ func (d *directfsDentry) getHostChild(name string) (*dentry, error) {
 		return nil, err
 	}
 	return d.fs.newDirectfsDentry(childFD)
+}
+
+func (d *directfsDentry) getXattr(name string, size uint64) (string, error) {
+	data := make([]byte, size)
+	if _, err := unix.Fgetxattr(d.controlFD, name, data); err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // getCreatedChild opens the newly created child, sets its uid/gid, constructs
@@ -527,6 +538,8 @@ func (d *directfsDentry) link(target *directfsDentry, name string) (*dentry, err
 	}
 	// Note that we don't need to set uid/gid for the new child. This is a hard
 	// link. The original file already has the right owner.
+	// TODO(gvisor.dev/issue/6739): Hard linked dentries should share the same
+	// inode fields.
 	return d.getCreatedChild(name, -1 /* uid */, -1 /* gid */, false /* isDir */)
 }
 
@@ -565,29 +578,17 @@ func (d *directfsDentry) getDirentsLocked(recordDirent func(name string, key ino
 		return err
 	}
 
-	var direntsBuf [8192]byte
-	for {
-		n, err := unix.Getdents(readFD, direntsBuf[:])
+	return fsutil.ForEachDirent(readFD, func(ino uint64, off int64, ftype uint8, name string, reclen uint16) {
+		// We also want the device ID, which annoyingly incurs an additional
+		// syscall per dirent.
+		// TODO(gvisor.dev/issue/6665): Get rid of per-dirent stat.
+		stat, err := fsutil.StatAt(d.controlFD, name)
 		if err != nil {
-			return err
+			log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(genericDebugPathname(&d.dentry), name), err)
+			return
 		}
-		if n <= 0 {
-			return nil
-		}
-
-		fsutil.ParseDirents(direntsBuf[:n], func(ino uint64, off int64, ftype uint8, name string, reclen uint16) bool {
-			// We also want the device ID, which annoyingly incurs an additional
-			// syscall per dirent.
-			// TODO(gvisor.dev/issue/6665): Get rid of per-dirent stat.
-			stat, err := fsutil.StatAt(d.controlFD, name)
-			if err != nil {
-				log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(genericDebugPathname(&d.dentry), name), err)
-				return true
-			}
-			recordDirent(name, inoKeyFromStat(&stat), ftype)
-			return true
-		})
-	}
+		recordDirent(name, inoKeyFromStat(&stat), ftype)
+	})
 }
 
 // Precondition: fs.renameMu is locked.

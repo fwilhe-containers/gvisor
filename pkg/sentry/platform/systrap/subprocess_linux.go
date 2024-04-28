@@ -40,7 +40,7 @@ func createStub() (*thread, error) {
 	// transitively) will be killed as well. It's simply not possible to
 	// safely handle a single stub getting killed: the exact state of
 	// execution is unknown and not recoverable.
-	return attachedThread(uintptr(unix.SIGKILL)|unix.CLONE_FILES, linux.SECCOMP_RET_TRAP)
+	return attachedThread(unix.CLONE_FILES|uintptr(unix.SIGCHLD), linux.SECCOMP_RET_TRAP)
 }
 
 // attachedThread returns a new attached thread.
@@ -54,17 +54,19 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	rules := []seccomp.RuleSet{}
 	if defaultAction != linux.SECCOMP_RET_ALLOW {
 		ruleSet := seccomp.RuleSet{
-			Rules: seccomp.SyscallRules{
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 				unix.SYS_CLONE: seccomp.Or{
 					// Allow creation of new subprocesses (used by the master).
-					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGKILL)},
+					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.CLONE_PARENT | unix.SIGCHLD)},
+					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGCHLD)},
 					// Allow creation of new sysmsg thread.
 					seccomp.PerArg{seccomp.EqualTo(
 						unix.CLONE_FILES |
 							unix.CLONE_FS |
 							unix.CLONE_VM |
-							unix.CLONE_PTRACE)},
-					// Allow creation of new threads within a single address space (used by addresss spaces).
+							unix.CLONE_PTRACE |
+							linux.SIGKILL)},
+					// Allow creation of new threads within a single address space (used by address spaces).
 					seccomp.PerArg{seccomp.EqualTo(
 						unix.CLONE_FILES |
 							unix.CLONE_FS |
@@ -118,19 +120,30 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 					seccomp.AnyValue{},
 					seccomp.EqualTo(unix.SIGSTOP),
 				},
-				unix.SYS_GETTID: seccomp.MatchAll{},
-				seccomp.SYS_SECCOMP: seccomp.PerArg{
-					seccomp.EqualTo(linux.SECCOMP_SET_MODE_FILTER),
-					seccomp.EqualTo(0),
-					seccomp.AnyValue{},
+				unix.SYS_GETTID:     seccomp.MatchAll{},
+				unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
+				seccomp.SYS_SECCOMP: seccomp.Or{
+					seccomp.PerArg{
+						seccomp.EqualTo(linux.SECCOMP_SET_MODE_FILTER),
+						seccomp.EqualTo(0),
+						seccomp.AnyValue{},
+					},
+					seccomp.PerArg{
+						seccomp.EqualTo(linux.SECCOMP_SET_MODE_FILTER),
+						seccomp.EqualTo(linux.SECCOMP_FILTER_FLAG_NEW_LISTENER),
+						seccomp.AnyValue{},
+					},
 				},
-			},
+			}),
 			Action: linux.SECCOMP_RET_ALLOW,
 		}
 		rules = append(rules, ruleSet)
 		rules = appendArchSeccompRules(rules)
 	}
-	instrs, err := seccomp.BuildProgram(rules, defaultAction, defaultAction)
+	instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+		DefaultAction: defaultAction,
+		BadArchAction: defaultAction,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +192,9 @@ func forkStub(flags uintptr, instrs []bpf.Instruction) (*thread, error) {
 		if sig := t.wait(stopped); sig != unix.SIGSTOP {
 			return nil, fmt.Errorf("wait failed: expected SIGSTOP, got %v", sig)
 		}
-		t.attach()
+		if err := t.attach(); err != nil {
+			return nil, err
+		}
 		t.grabInitRegs()
 		_, err := t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_MUNMAP,
 			arch.SyscallArgument{Value: stubROMapEnd},
@@ -251,7 +266,7 @@ func (t *thread) createStub() (*thread, error) {
 	pid, err := t.syscallIgnoreInterrupt(
 		&regs,
 		unix.SYS_CLONE,
-		arch.SyscallArgument{Value: uintptr(unix.SIGKILL | unix.CLONE_FILES)},
+		arch.SyscallArgument{Value: uintptr(unix.CLONE_FILES | unix.CLONE_PARENT | uintptr(unix.SIGCHLD))},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
@@ -267,15 +282,7 @@ func (t *thread) createStub() (*thread, error) {
 	// We unfortunately don't have a handy part of memory to write the wait
 	// status. If the wait succeeds, we'll assume that it was the SIGSTOP.
 	// If the child actually exited, the attach below will fail.
-	_, err = t.syscallIgnoreInterrupt(
-		&t.initRegs,
-		unix.SYS_WAIT4,
-		arch.SyscallArgument{Value: uintptr(pid)},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: unix.WALL | unix.WUNTRACED},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: 0})
+	_, err = unix.Wait4(int(pid), nil, unix.WALL|unix.WUNTRACED, nil)
 	if err != nil {
 		return nil, fmt.Errorf("waiting on stub process: %v", err)
 	}
@@ -294,7 +301,12 @@ func (s *subprocess) createStub() (*thread, error) {
 	s.requests <- req
 
 	childT := <-req.done
-	childT.attach()
+	if childT == nil {
+		return nil, fmt.Errorf("createStub: failed to get clone")
+	}
+	if err := childT.attach(); err != nil {
+		return nil, err
+	}
 	childT.grabInitRegs()
 
 	return childT, nil

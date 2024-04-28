@@ -337,10 +337,17 @@ func (vfs *VirtualFilesystem) CommitRenameExchangeDentry(from, to *Dentry) {
 func (vfs *VirtualFilesystem) forgetDeadMountpoint(ctx context.Context, d *Dentry) []refs.RefCounter {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
-	vfs.mounts.seq.BeginWrite()
 	for mnt := range vfs.mountpoints[d] {
-		vfs.umountRecursiveLocked(mnt, &umountRecursiveOptions{})
+		// If umounted is true, the mount point has already been decrefed by umount
+		// so we don't need to release the reference again here.
+		if mnt.umounted {
+			vfs.mounts.seq.BeginWrite()
+			vfs.disconnectLocked(mnt)
+			vfs.delayDecRef(mnt)
+			vfs.mounts.seq.EndWrite()
+		} else {
+			vfs.umountTreeLocked(mnt, &umountRecursiveOptions{})
+		}
 	}
-	vfs.mounts.seq.EndWrite()
 	return vfs.PopDelayedDecRefs()
 }

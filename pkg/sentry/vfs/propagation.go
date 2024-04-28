@@ -15,8 +15,6 @@
 package vfs
 
 import (
-	"fmt"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/context"
@@ -62,13 +60,17 @@ func (vfs *VirtualFilesystem) commitMount(ctx context.Context, mnt *Mount) {
 	if child != nil {
 		vfs.delayDecRef(vfs.disconnectLocked(child))
 	}
+	mp.dentry.mu.Lock()
 	vfs.connectLocked(mnt, mp, mp.mount.ns)
+	mp.dentry.mu.Unlock()
 	vfs.delayDecRef(mnt)
 
 	if child != nil {
 		newmp := VirtualDentry{mnt, mnt.root}
 		newmp.IncRef()
+		newmp.dentry.mu.Lock()
 		vfs.connectLocked(child, newmp, newmp.mount.ns)
+		newmp.dentry.mu.Unlock()
 		vfs.delayDecRef(child)
 	}
 	vfs.mounts.seq.EndWrite()
@@ -106,42 +108,31 @@ func (vfs *VirtualFilesystem) SetMountPropagationAt(ctx context.Context, creds *
 	if !bits.IsPowerOfTwo32(propFlag) {
 		return linuxerr.EINVAL
 	}
-	vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+	vd, err := vfs.getMountpoint(ctx, creds, pop)
 	if err != nil {
 		return err
 	}
-	// See the similar defer in UmountAt for why this is in a closure.
-	defer func() {
-		vd.DecRef(ctx)
-	}()
-	if vd.dentry.isMounted() {
-		if realmnt := vfs.getMountAt(ctx, vd.mount, vd.dentry); realmnt != nil {
-			vd.mount.DecRef(ctx)
-			vd.mount = realmnt
-		}
-	} else if vd.dentry != vd.mount.root {
-		return linuxerr.EINVAL
-	}
+	defer vd.DecRef(ctx)
 	vfs.SetMountPropagation(vd.mount, propFlag, recursive)
 	return nil
 }
 
 // SetMountPropagation changes the propagation type of the mount.
-func (vfs *VirtualFilesystem) SetMountPropagation(mnt *Mount, propFlags uint32, recursive bool) error {
+func (vfs *VirtualFilesystem) SetMountPropagation(mnt *Mount, propFlag uint32, recursive bool) error {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(context.Background())
-	if propFlags == linux.MS_SHARED {
+	if propFlag == linux.MS_SHARED {
 		if err := vfs.allocMountGroupIDs(mnt, recursive); err != nil {
-			return fmt.Errorf("allocMountGroupIDs: %v", err)
+			return err
 		}
 	}
 
 	if !recursive {
-		vfs.setPropagation(mnt, propFlags)
+		vfs.setPropagation(mnt, propFlag)
 		return nil
 	}
 	for _, m := range mnt.submountsLocked() {
-		vfs.setPropagation(m, propFlags)
+		vfs.setPropagation(m, propFlag)
 	}
 	return nil
 }
@@ -275,7 +266,7 @@ func (vfs *VirtualFilesystem) peers(m1, m2 *Mount) bool {
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) propagateMount(ctx context.Context, dstMnt *Mount, dstPoint *Dentry, state *propState) error {
 	// Skip newly added mounts.
-	if dstMnt.neverConnected() {
+	if dstMnt.neverConnected() || dstMnt.umounted {
 		return nil
 	}
 	mp := VirtualDentry{mount: dstMnt, dentry: dstPoint}
@@ -445,21 +436,26 @@ func (vfs *VirtualFilesystem) arePropMountsBusy(mnt *Mount) bool {
 	return false
 }
 
-// allocateGroupID returns a new mount group id if one is available, and
-// error otherwise. If the group ID bitmap is full, double the size of the
-// bitmap before allocating the new group id. It is analogous to
-// fs/namespace.c:mnt_alloc_group_id() in Linux.
+// allocateGroupID populates mnt.groupID with a new group id if one is
+// available, and returns an error otherwise. If the group ID bitmap is full,
+// double the size of the bitmap before allocating the new group id. It is
+// analogous to fs/namespace.c:mnt_alloc_group_id() in Linux.
 //
 // +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) allocateGroupID() (uint32, error) {
+func (vfs *VirtualFilesystem) allocateGroupID(mnt *Mount) error {
 	groupID, err := vfs.groupIDBitmap.FirstZero(1)
 	if err != nil {
 		if err := vfs.groupIDBitmap.Grow(uint32(vfs.groupIDBitmap.Size())); err != nil {
-			return 0, err
+			return linuxerr.ENOSPC
+		}
+		groupID, err = vfs.groupIDBitmap.FirstZero(1)
+		if err != nil {
+			return err
 		}
 	}
 	vfs.groupIDBitmap.Add(groupID)
-	return groupID, nil
+	mnt.groupID = groupID
+	return nil
 }
 
 // freeGroupID marks a groupID as available for reuse. It is analogous to
@@ -471,14 +467,14 @@ func (vfs *VirtualFilesystem) freeGroupID(mnt *Mount) {
 	mnt.groupID = 0
 }
 
-// freeMountGroupIDs zeroes out all of the mounts' groupIDs and returns them
+// cleanupGroupIDs zeroes out all of the mounts' groupIDs and returns them
 // to the pool of available ids. It is analogous to
 // fs/namespace.c:cleanup_group_ids() in Linux.
 //
 // +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) freeMountGroupIDs(mnts []*Mount) {
+func (vfs *VirtualFilesystem) cleanupGroupIDs(mnts []*Mount) {
 	for _, m := range mnts {
-		if m.groupID != 0 && m.isShared {
+		if m.groupID != 0 && !m.isShared {
 			vfs.freeGroupID(m)
 		}
 	}
@@ -498,15 +494,163 @@ func (vfs *VirtualFilesystem) allocMountGroupIDs(mnt *Mount, recursive bool) err
 	}
 	for _, m := range mnts {
 		if m.groupID == 0 && !m.isShared {
-			gid, err := vfs.allocateGroupID()
-			m.groupID = gid
-			if err != nil {
-				vfs.freeMountGroupIDs(mnts)
+			if err := vfs.allocateGroupID(m); err != nil {
+				vfs.cleanupGroupIDs(mnts)
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// propagateUmount returns a list of mounts that the umount of mnts propagates
+// to.
+//
+// Prerequisites: all the mounts in mnts have had vfs.umount() called on them.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) propagateUmount(mnts []*Mount) []*Mount {
+	const (
+		umountVisited = iota
+		umountRestore
+	)
+	var toUmount []*Mount
+	noChildren := make(map[*Mount]struct{})
+	// Processed contains all the mounts that the algorithm has processed so far.
+	// If the mount maps to umountRestore, it should be restored after processing
+	// all the mounts. This happens in cases where a mount was speculatively
+	// unmounted that had children or is a cover mount.
+	processed := make(map[*Mount]int)
+
+	// Iterate through the mounts from the leafs back to the root.
+	for i := len(mnts) - 1; i >= 0; i-- {
+		mnt := mnts[i]
+
+		// If a mount has already been visited we know all its peers and followers
+		// have been visited so there's no need to visit them again.
+		if _, ok := processed[mnt]; ok {
+			continue
+		}
+		processed[mnt] = umountVisited
+
+		parent := mnt.parent()
+		if parent == nil {
+			continue
+		}
+		for m := nextPropMount(parent, parent); m != nil; m = nextPropMount(m, parent) {
+			child := vfs.mounts.Lookup(m, mnt.point())
+			if child == nil {
+				continue
+			}
+			if _, ok := processed[child]; ok {
+				// If the child has been visited we know its peer group and followers
+				// have all been visited so there's no need to visit them again. We can
+				// skip this propagation subtree by setting the iterator to be the last
+				// mount in the follower group.
+				if !child.followerList.Empty() {
+					m = child.followerList.Back()
+				}
+				continue
+			} else if child.umounted {
+				// If this child has already been marked for unmounting, just mark it
+				// as visited and move on. This means it was either part of the original
+				// mount list passed to this method or was umounted from another mount's
+				// propagation. In either case we can consider all its peers and
+				// followers as visited.
+				processed[child] = umountVisited
+				continue
+			}
+
+			// This loop starts at the child we are propagating the umount to and
+			// iterates through the child's parents. It continues as until it
+			// encounters a parent that's been visited.
+		loop:
+			for {
+				if _, ok := noChildren[child]; ok || child.umounted {
+					break
+				}
+				// If there are any children that have mountpoint != parent's root then
+				// the current mount cannot be unmounted.
+				for gchild := range child.children {
+					if gchild.point() == child.root {
+						continue
+					}
+					_, isProcessed := processed[gchild]
+					_, hasNoChildren := noChildren[gchild]
+					if isProcessed && hasNoChildren {
+						continue
+					}
+					processed[child] = umountRestore
+					break loop
+				}
+				if child.locked {
+					processed[child] = umountRestore
+					noChildren[child] = struct{}{}
+				} else {
+					vfs.umount(child)
+					toUmount = append(toUmount, child)
+				}
+				// If this parent was a mount that had to be restored because it had
+				// children, it might be safe to umount now that its child is gone. If
+				// it has been visited then it's already being umounted.
+				child = child.parent()
+				if _, ok := processed[child]; !ok {
+					break
+				}
+			}
+		}
+	}
+
+	// Add all the children of mounts marked for umount to the umount list. This
+	// excludes "cover" mounts (mounts whose mount point is equal to their
+	// parent's root) which will be reparented in the next step.
+	for i := 0; i < len(toUmount); i++ {
+		umount := toUmount[i]
+		for child := range umount.children {
+			if child.point() == umount.root {
+				processed[child] = umountRestore
+			} else {
+				vfs.umount(child)
+				toUmount = append(toUmount, child)
+			}
+		}
+	}
+
+	vfs.mounts.seq.BeginWrite()
+	for m, status := range processed {
+		if status == umountVisited {
+			continue
+		}
+		mp := m.getKey()
+		for mp.mount.umounted {
+			mp = mp.mount.getKey()
+		}
+		if mp != m.getKey() {
+			vfs.changeMountpoint(m, mp)
+		}
+	}
+	vfs.mounts.seq.EndWrite()
+
+	return toUmount
+}
+
+// unlockPropagationMounts sets locked to false for every mount that a umount
+// of mnt propagates to. It is analogous to fs/pnode.c:propagate_mount_unlock()
+// in Linux.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) unlockPropagationMounts(mnt *Mount) {
+	parent := mnt.parent()
+	if parent == nil {
+		return
+	}
+	for m := nextPropMount(parent, parent); m != nil; m = nextPropMount(m, parent) {
+		child := vfs.mounts.Lookup(m, mnt.point())
+		if child == nil {
+			continue
+		}
+		child.locked = false
+	}
 }
 
 // peerUnderRoot iterates through mnt's peers until it finds a mount that is in

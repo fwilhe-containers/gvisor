@@ -16,6 +16,10 @@
 // https://github.com/NVIDIA/open-gpu-kernel-modules
 package nvgpu
 
+import (
+	"fmt"
+)
+
 // Device numbers.
 const (
 	NV_MAJOR_DEVICE_NUMBER          = 195 // from kernel-open/common/inc/nv.h
@@ -30,6 +34,11 @@ type Handle struct {
 	Val uint32
 }
 
+// String implements fmt.Stringer.String.
+func (h Handle) String() string {
+	return fmt.Sprintf("%#x", h.Val)
+}
+
 // P64 is NvP64, from src/common/sdk/nvidia/inc/nvtypes.h.
 //
 // +marshal
@@ -39,6 +48,12 @@ type P64 uint64
 const (
 	NV_MAX_DEVICES    = 32
 	NV_MAX_SUBDEVICES = 8
+)
+
+// From src/common/sdk/nvidia/inc/alloc/alloc_channel.h.
+const (
+	CC_CHAN_ALLOC_IV_SIZE_DWORD    = 3
+	CC_CHAN_ALLOC_NONCE_SIZE_DWORD = 8
 )
 
 // RS_ACCESS_MASK is RS_ACCESS_MASK, from
@@ -62,3 +77,8 @@ type RS_SHARE_POLICY struct {
 	Action     uint8
 	Pad        [1]byte
 }
+
+// NvUUID is defined in src/common/inc/nvCpuUuid.h.
+//
+// +marshal
+type NvUUID [16]uint8

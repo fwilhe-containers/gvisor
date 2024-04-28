@@ -17,7 +17,6 @@ package boot
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path"
 	gtime "time"
 
@@ -34,13 +33,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
-	"gvisor.dev/gvisor/pkg/sentry/state"
-	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/watchdog"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -103,6 +97,9 @@ const (
 
 	// ContMgrMount mounts a filesystem in a container.
 	ContMgrMount = "containerManager.Mount"
+
+	// ContMgrContainerRuntimeState returns the runtime state of a container.
+	ContMgrContainerRuntimeState = "containerManager.ContainerRuntimeState"
 )
 
 const (
@@ -188,7 +185,10 @@ func newController(fd int, l *Loader) (*controller, error) {
 	ctrl.srv.Register(&debug{})
 
 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
-		ctrl.srv.Register(&Network{Stack: eps.Stack})
+		ctrl.srv.Register(&Network{
+			Stack:  eps.Stack,
+			Kernel: l.k,
+		})
 	}
 	if l.root.conf.ProfileEnable {
 		ctrl.srv.Register(control.NewProfile(l.k))
@@ -222,6 +222,11 @@ type containerManager struct {
 func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	log.Debugf("containerManager.StartRoot, cid: %s", *cid)
 	// Tell the root container to start and wait for the result.
+	return cm.onStart()
+}
+
+// onStart notifies that sandbox is ready to start and wait for the result.
+func (cm *containerManager) onStart() error {
 	cm.startChan <- struct{}{}
 	if err := <-cm.startResultChan; err != nil {
 		return fmt.Errorf("starting sandbox: %v", err)
@@ -273,18 +278,21 @@ type StartArgs struct {
 	// CID is the ID of the container to start.
 	CID string
 
-	// NumOverlayFilestoreFDs is the number of overlay filestore FDs donated.
-	// Optionally configured with the overlay2 flag.
-	NumOverlayFilestoreFDs int
+	// NumGoferFilestoreFDs is the number of gofer filestore FDs donated.
+	NumGoferFilestoreFDs int
 
-	// OverlayMediums contains information about how the gofer mounts have been
-	// overlaid. The first entry is for rootfs and the following entries are for
-	// bind mounts in Spec.Mounts (in the same order).
-	OverlayMediums []OverlayMedium
+	// IsDevIoFilePresent indicates whether the dev gofer FD is present.
+	IsDevIoFilePresent bool
+
+	// GoferMountConfs contains information about how the gofer mounts have been
+	// configured. The first entry is for rootfs and the following entries are
+	// for bind mounts in Spec.Mounts (in the same order).
+	GoferMountConfs []GoferMountConf
 
 	// FilePayload contains, in order:
 	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
-	//   * file descriptors to overlay-backing host files (optional: for overlay2).
+	//   * file descriptors to gofer-backing host files (optional).
+	//   * file descriptor for /dev gofer connection (optional)
 	//   * file descriptors to connect to gofer to serve the root filesystem.
 	urpc.FilePayload
 }
@@ -306,7 +314,10 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		return errors.New("start argument missing container ID")
 	}
 	expectedFDs := 1 // At least one FD for the root filesystem.
-	expectedFDs += args.NumOverlayFilestoreFDs
+	expectedFDs += args.NumGoferFilestoreFDs
+	if args.IsDevIoFilePresent {
+		expectedFDs++
+	}
 	if !args.Spec.Process.Terminal {
 		expectedFDs += 3
 	}
@@ -335,15 +346,31 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		}
 	}()
 
-	var overlayFilestoreFDs []*fd.FD
-	for i := 0; i < args.NumOverlayFilestoreFDs; i++ {
-		overlayFilestoreFD, err := fd.NewFromFile(goferFiles[i])
+	var goferFilestoreFDs []*fd.FD
+	for i := 0; i < args.NumGoferFilestoreFDs; i++ {
+		goferFilestoreFD, err := fd.NewFromFile(goferFiles[i])
 		if err != nil {
-			return fmt.Errorf("error dup'ing overlay filestore file: %w", err)
+			return fmt.Errorf("error dup'ing gofer filestore file: %w", err)
 		}
-		overlayFilestoreFDs = append(overlayFilestoreFDs, overlayFilestoreFD)
+		goferFilestoreFDs = append(goferFilestoreFDs, goferFilestoreFD)
 	}
-	goferFiles = goferFiles[args.NumOverlayFilestoreFDs:]
+	goferFiles = goferFiles[args.NumGoferFilestoreFDs:]
+	defer func() {
+		for _, fd := range goferFilestoreFDs {
+			_ = fd.Close()
+		}
+	}()
+
+	var devGoferFD *fd.FD
+	if args.IsDevIoFilePresent {
+		var err error
+		devGoferFD, err = fd.NewFromFile(goferFiles[0])
+		if err != nil {
+			return fmt.Errorf("error dup'ing dev gofer file: %w", err)
+		}
+		goferFiles = goferFiles[1:]
+		defer devGoferFD.Close()
+	}
 
 	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
@@ -355,7 +382,7 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		}
 	}()
 
-	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, overlayFilestoreFDs, args.OverlayMediums); err != nil {
+	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs); err != nil {
 		log.Debugf("containerManager.StartSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -423,12 +450,13 @@ func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) erro
 
 // RestoreOpts contains options related to restoring a container's file system.
 type RestoreOpts struct {
-	// FilePayload contains the state file to be restored, followed by the
-	// platform device file if necessary.
+	// FilePayload contains the state file to be restored, followed in order by:
+	// 1. checkpoint state file.
+	// 2. optional checkpoint pages file.
+	// 3. optional platform device file.
 	urpc.FilePayload
-
-	// SandboxID contains the ID of the sandbox.
-	SandboxID string
+	HavePagesFile  bool
+	HaveDeviceFile bool
 }
 
 // Restore loads a container from a statefile.
@@ -438,111 +466,63 @@ type RestoreOpts struct {
 func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Restore")
 
-	var specFile, deviceFile *os.File
-	switch numFiles := len(o.Files); numFiles {
-	case 2:
-		// The device file is donated to the platform.
-		// Can't take ownership away from os.File. dup them to get a new FD.
-		fd, err := unix.Dup(int(o.Files[1].Fd()))
-		if err != nil {
-			return fmt.Errorf("failed to dup file: %v", err)
-		}
-		deviceFile = os.NewFile(uintptr(fd), "platform device")
-		fallthrough
-	case 1:
-		specFile = o.Files[0]
-	case 0:
+	if cm.l.state == restoring {
+		return fmt.Errorf("restore is already in progress")
+	}
+	if cm.l.state == started {
+		return fmt.Errorf("cannot restore a started container")
+	}
+	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
-	default:
-		return fmt.Errorf("at most two files may be passed to Restore")
+	}
+
+	stateFile, err := o.ReleaseFD(0)
+	if err != nil {
+		return err
+	}
+	defer stateFile.Close()
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(stateFile.FD(), &stat); err != nil {
+		return err
+	}
+	if stat.Size == 0 {
+		return fmt.Errorf("statefile cannot be empty")
+	}
+
+	r := restorer{container: &cm.l.root, stateFile: stateFile}
+	cm.l.state = restoring
+
+	fileIdx := 1
+	if o.HavePagesFile {
+		pagesFile, err := o.ReleaseFD(fileIdx)
+		if err != nil {
+			return err
+		}
+		defer pagesFile.Close()
+		fileIdx++
+		r.pagesFile = pagesFile
+	}
+
+	if o.HaveDeviceFile {
+		r.deviceFile, err = o.ReleaseFD(fileIdx)
+		if err != nil {
+			return err
+		}
+		fileIdx++
+	}
+
+	if fileIdx < len(o.Files) {
+		return fmt.Errorf("more files passed to Restore than expected")
 	}
 
 	// Pause the kernel while we build a new one.
 	cm.l.k.Pause()
 
-	p, err := createPlatform(cm.l.root.conf, deviceFile)
-	if err != nil {
-		return fmt.Errorf("creating platform: %v", err)
-	}
-	k := &kernel.Kernel{
-		Platform: p,
-	}
-	mf, err := createMemoryFile()
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
-	}
-	k.SetMemoryFile(mf)
-	networkStack := cm.l.k.RootNetworkNamespace().Stack()
-	cm.l.k = k
-
-	// Set up the restore environment.
-	ctx := k.SupervisorContext()
-	// TODO(b/298078576): Need to process hints here probably
-	mntr := newContainerMounter(&cm.l.root, cm.l.k, cm.l.mountHints, cm.l.sharedMounts, cm.l.productName, o.SandboxID)
-	ctx, err = mntr.configureRestore(ctx)
-	if err != nil {
-		return fmt.Errorf("configuring filesystem restore: %v", err)
-	}
-
-	// Prepare to load from the state file.
-	if eps, ok := networkStack.(*netstack.Stack); ok {
-		stack.StackFromEnv = eps.Stack // FIXME(b/36201077)
-	}
-	info, err := specFile.Stat()
-	if err != nil {
+	if err := r.restore(cm.l); err != nil {
 		return err
 	}
-	if info.Size() == 0 {
-		return fmt.Errorf("file cannot be empty")
-	}
-
-	if cm.l.root.conf.ProfileEnable {
-		// pprof.Initialize opens /proc/self/maps, so has to be called before
-		// installing seccomp filters.
-		pprof.Initialize()
-	}
-
-	// Seccomp filters have to be applied before parsing the state file.
-	if err := cm.l.installSeccompFilters(); err != nil {
-		return err
-	}
-
-	// Load the state.
-	loadOpts := state.LoadOpts{Source: specFile}
-	if err := loadOpts.Load(ctx, k, nil, networkStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
-		return err
-	}
-
-	// Since we have a new kernel we also must make a new watchdog.
-	dogOpts := watchdog.DefaultOpts
-	dogOpts.TaskTimeoutAction = cm.l.root.conf.WatchdogAction
-	dog := watchdog.New(k, dogOpts)
-
-	// Change the loader fields to reflect the changes made when restoring.
-	cm.l.k = k
-	cm.l.watchdog = dog
-	cm.l.root.procArgs = kernel.CreateProcessArgs{}
-	cm.l.restore = true
-
-	// Reinitialize the sandbox ID and processes map. Note that it doesn't
-	// restore the state of multiple containers, nor exec processes.
-	cm.l.sandboxID = o.SandboxID
-	cm.l.mu.Lock()
-	eid := execID{cid: o.SandboxID}
-	cm.l.processes = map[execID]*execProcess{
-		eid: {
-			tg: cm.l.k.GlobalInit(),
-		},
-	}
-	cm.l.mu.Unlock()
-
-	// Tell the root container to start and wait for the result.
-	cm.startChan <- struct{}{}
-	if err := <-cm.startResultChan; err != nil {
-		return fmt.Errorf("starting sandbox: %v", err)
-	}
-
-	return nil
+	return cm.onStart()
 }
 
 // Wait waits for the init process in the given container.
@@ -747,9 +727,9 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 		opts = vfs.MountOptions{
 			ReadOnly: true,
 			GetFilesystemOptions: vfs.GetFilesystemOptions{
-				Data: fmt.Sprintf("ifd=%d", imageFD),
+				InternalMount: true,
+				Data:          fmt.Sprintf("ifd=%d", imageFD),
 			},
-			InternalMount: true,
 		}
 
 	default:
@@ -771,5 +751,12 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 	}
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q, in container %q", source, dest, fstype, opts.GetFilesystemOptions.Data, args.ContainerID)
 	cu.Release()
+	return nil
+}
+
+// ContainerRuntimeState returns the runtime state of a container.
+func (cm *containerManager) ContainerRuntimeState(cid *string, state *ContainerRuntimeState) error {
+	log.Debugf("containerManager.ContainerRuntimeState: cid: %s", cid)
+	*state = cm.l.containerRuntimeState(*cid)
 	return nil
 }

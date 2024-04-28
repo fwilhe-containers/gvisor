@@ -22,24 +22,18 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
-	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Register registers all devices implemented by this package in vfsObj.
-func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
+func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, uvmDevMajor uint32) error {
 	// The kernel driver's interface is unstable, so only allow versions of the
 	// driver that are known to be supported.
-	versionStr, err := hostDriverVersion()
-	if err != nil {
-		return fmt.Errorf("failed to get Nvidia driver version: %w", err)
-	}
-	version, err := driverVersionFrom(versionStr)
+	log.Infof("NVIDIA driver version: %s", versionStr)
+	version, err := DriverVersionFrom(versionStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse Nvidia driver version %s: %w", versionStr, err)
 	}
@@ -47,10 +41,11 @@ func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
 	if !ok {
 		return fmt.Errorf("unsupported Nvidia driver version: %s", versionStr)
 	}
-	log.Infof("Nvidia driver version: %s", versionStr)
 	nvp := &nvproxy{
-		objsLive: make(map[nvgpu.Handle]*object),
-		abi:      abiCons(),
+		abi:         abiCons.cons(),
+		version:     version,
+		clients:     make(map[nvgpu.Handle]*rootClient),
+		objsFreeSet: make(map[*object]struct{}),
 	}
 	for minor := uint32(0); minor <= nvgpu.NV_CONTROL_DEVICE_MINOR; minor++ {
 		if err := vfsObj.RegisterDevice(vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, minor, &frontendDevice{
@@ -72,64 +67,20 @@ func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
 	return nil
 }
 
-// CreateDriverDevtmpfsFiles creates device special files in dev that should
-// always exist when this package is enabled. It does not create per-device
-// files in dev; see CreateIndexDevtmpfsFile.
-func CreateDriverDevtmpfsFiles(ctx context.Context, dev *devtmpfs.Accessor, uvmDevMajor uint32) error {
-	if err := dev.CreateDeviceFile(ctx, "nvidiactl", vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, nvgpu.NV_CONTROL_DEVICE_MINOR, 0666); err != nil {
-		return err
-	}
-	if err := dev.CreateDeviceFile(ctx, "nvidia-uvm", vfs.CharDevice, uvmDevMajor, nvgpu.NVIDIA_UVM_PRIMARY_MINOR_NUMBER, 0666); err != nil {
-		return err
-	}
-	return nil
-}
-
-// CreateIndexDevtmpfsFile creates the device special file in dev for the
-// device with the given index.
-func CreateIndexDevtmpfsFile(ctx context.Context, dev *devtmpfs.Accessor, minor uint32) error {
-	return dev.CreateDeviceFile(ctx, fmt.Sprintf("nvidia%d", minor), vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, minor, 0666)
-}
-
 // +stateify savable
 type nvproxy struct {
-	objsMu   objsMutex `state:"nosave"`
-	objsLive map[nvgpu.Handle]*object
-	abi      *driverABI
-}
+	abi     *driverABI `state:"nosave"`
+	version DriverVersion
 
-// object tracks an object allocated through the driver.
-//
-// +stateify savable
-type object struct {
-	impl objectImpl
-}
-
-func (o *object) init(impl objectImpl) {
-	o.impl = impl
-}
-
-// Release is called after the represented object is freed.
-func (o *object) Release(ctx context.Context) {
-	o.impl.Release(ctx)
-}
-
-type objectImpl interface {
-	Release(ctx context.Context)
-}
-
-// osDescMem is an objectImpl tracking an OS descriptor.
-//
-// +stateify savable
-type osDescMem struct {
-	object
-	pinnedRanges []mm.PinnedRange
-}
-
-// Release implements objectImpl.Release.
-func (o *osDescMem) Release(ctx context.Context) {
-	ctx.Infof("nvproxy: unpinning pages for released OS descriptor")
-	mm.Unpin(o.pinnedRanges)
+	// See object.go.
+	// Users should call nvproxy.objsLock/Unlock() rather than locking objsMu
+	// directly.
+	objsMu objsMutex `state:"nosave"`
+	// These fields are protected by objsMu.
+	clients      map[nvgpu.Handle]*rootClient
+	objsCleanup  []func()             `state:"nosave"`
+	objsFreeList objectFreeList       `state:"nosave"`
+	objsFreeSet  map[*object]struct{} `state:"nosave"`
 }
 
 type marshalPtr[T any] interface {

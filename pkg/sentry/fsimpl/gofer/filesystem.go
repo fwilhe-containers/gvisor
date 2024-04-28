@@ -272,7 +272,7 @@ func (fs *filesystem) getRemoteChildLocked(ctx context.Context, parent *dentry, 
 	defer parent.childrenMu.Unlock()
 
 	if checkForRace {
-		// See if we raced with anoter getRemoteChild call that added
+		// See if we raced with another getRemoteChild call that added
 		// to the cache.
 		if cachedChild, ok := parent.children[name]; ok && cachedChild != nil {
 			// We raced. Destroy our child and return the cached
@@ -809,6 +809,10 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if d.nlink.Load() == math.MaxUint32 {
 			return nil, linuxerr.EMLINK
 		}
+		if d.isSynthetic() {
+			// TODO(gvisor.dev/issue/6739): Add synthetic file hard link support.
+			return nil, linuxerr.EOPNOTSUPP
+		}
 		return parent.link(ctx, d, name)
 	}, nil)
 
@@ -1139,7 +1143,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	}
 
 	if trunc {
-		// If no errors occured so far then update file size in memory. This
+		// If no errors occurred so far then update file size in memory. This
 		// step is required even if !d.cachedMetadataAuthoritative() because
 		// d.mappings has to be updated.
 		// d.metadataMu has already been acquired if trunc == true.
@@ -1753,6 +1757,11 @@ func (fs *filesystem) MountOptions() string {
 		{moptDfltGID, fs.opts.dfltgid},
 	}
 
+	if globalDentryCache != nil {
+		optsKV = append(optsKV, mopt{moptDcache, fmt.Sprintf("%d-global", globalDentryCache.maxCachedDentries)})
+	} else {
+		optsKV = append(optsKV, mopt{moptDcache, fs.opts.dcache})
+	}
 	switch fs.opts.interop {
 	case InteropModeExclusive:
 		optsKV = append(optsKV, mopt{moptCache, cacheFSCache})

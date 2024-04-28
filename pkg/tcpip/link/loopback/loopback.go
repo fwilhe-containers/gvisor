@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package loopback provides the implemention of loopback data-link layer
+// Package loopback provides the implementation of loopback data-link layer
 // endpoints. Such endpoints just turn outbound packets into inbound ones.
 //
 // Loopback endpoints can be used in the networking stack by calling New() to
@@ -108,7 +108,7 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*endpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*endpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.
-func (*endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
