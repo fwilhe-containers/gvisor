@@ -18,6 +18,8 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/adler32"
 	"os"
 	"strings"
 	"time"
@@ -30,6 +32,8 @@ import (
 const (
 	snapshotBufferSize     = 1000
 	snapshotRingbufferSize = 16
+	// metricsPrefix is prepended before every metrics line.
+	metricsPrefix = "GVISOR_METRICS\t"
 )
 
 var (
@@ -85,7 +89,8 @@ func StartProfilingMetrics(profilingMetrics string, profilingRate time.Duration)
 	}
 
 	var values []func(fieldValues ...*FieldValue) uint64
-	header := strings.Builder{}
+	var header strings.Builder
+	header.WriteString(metricsPrefix)
 	header.WriteString("Time (ns)")
 	numMetrics := 0
 
@@ -136,6 +141,7 @@ func StartProfilingMetrics(profilingMetrics string, profilingRate time.Duration)
 	writeCh := make(chan writeReq, snapshotRingbufferSize)
 	go collectProfilingMetrics(&s, values, profilingRate, writeCh)
 	go writeProfilingMetrics(&s, header.String(), writeCh)
+	log.Infof("Profiling metrics started.")
 
 	return nil
 }
@@ -201,31 +207,67 @@ func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldVa
 	}
 }
 
+// hashWriter is a wrapper around a bufio.Writer that also updates a hasher.
+// The goal here is speed, and correctness is enforced by the reader of this
+// data checking the hash at the end.
+type hashWriter struct {
+	realWriter *bufio.Writer
+	hasher     hash.Hash32
+}
+
+// Write writes to the realWriter and also updates the hasher.
+func (w *hashWriter) Write(p []byte) (int, error) {
+	w.hasher.Write(p)
+	// We ignore the effects of partial writes on the hash computation here.
+	// This is OK because the goal of this writer is speed over correctness,
+	// and correctness is enforced by the reader of this data checking the
+	// hash at the end.
+	return w.realWriter.Write(p)
+}
+
+// WriteString writes a string to the realWriter and also updates the hasher.
+func (w *hashWriter) WriteString(s string) (int, error) {
+	w.hasher.Write([]byte(s))
+	return w.realWriter.WriteString(s)
+}
+
+// WriteRune writes a rune to the realWriter and also updates the hasher.
+func (w *hashWriter) WriteRune(r rune) {
+	w.hasher.Write([]byte(string(r)))
+	w.realWriter.WriteRune(r)
+}
+
 // writeProfilingMetrics will write to the ProfilingMetricsWriter on every
 // request via writeReqs, until writeReqs is closed.
 func writeProfilingMetrics(s *snapshots, header string, writeReqs <-chan writeReq) {
 	numEntries := s.numMetrics + 1
 
-	out := bufio.NewWriter(ProfilingMetricWriter)
+	out := hashWriter{
+		realWriter: bufio.NewWriter(ProfilingMetricWriter),
+		hasher:     adler32.New(),
+	}
 	out.WriteString(header)
 
 	for req := range writeReqs {
 		s.curWriterIndex.Store(int32(req.ringbufferIdx))
 
 		for i := 0; i < req.numLines; i++ {
+			out.WriteString(metricsPrefix)
 			base := i * numEntries
 			// Write the time
-			prometheus.WriteInteger(out, int64(s.ringbuffer[req.ringbufferIdx][base]))
+			prometheus.WriteInteger(&out, int64(s.ringbuffer[req.ringbufferIdx][base]))
 			// Then everything else
 			for j := 1; j < numEntries; j++ {
 				out.WriteRune('\t')
-				prometheus.WriteInteger(out, int64(s.ringbuffer[req.ringbufferIdx][base+j]))
+				prometheus.WriteInteger(&out, int64(s.ringbuffer[req.ringbufferIdx][base+j]))
 			}
 			out.WriteRune('\n')
 		}
 	}
 
-	out.Flush()
+	out.realWriter.WriteString(metricsPrefix)
+	out.realWriter.WriteString(fmt.Sprintf("ADLER32\t0x%x\n", out.hasher.Sum32()))
+	out.realWriter.Flush()
 	ProfilingMetricWriter.Close()
 	doneProfilingMetrics <- true
 	close(doneProfilingMetrics)

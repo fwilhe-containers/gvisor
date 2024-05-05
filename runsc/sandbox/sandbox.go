@@ -444,7 +444,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 
 // Restore sends the restore call for a container in the sandbox.
 func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, direct bool) error {
-	log.Debugf("Restore sandbox %q", s.ID)
+	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	stateFileName := path.Join(imagePath, boot.CheckpointStateFileName)
 	sf, err := os.Open(stateFileName)
@@ -468,8 +468,14 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, dir
 	}
 	if pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0); err == nil {
 		defer pf.Close()
+		pagesMetadataFileName := path.Join(imagePath, boot.CheckpointPagesMetadataFileName)
+		pmf, err := os.Open(pagesMetadataFileName)
+		if err != nil {
+			return fmt.Errorf("opening restore image file %q failed: %v", pagesMetadataFileName, err)
+		}
+		defer pmf.Close()
 		opt.HavePagesFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("opening restore image file %q failed: %v", pagesFileName, err)
 	}
@@ -499,6 +505,44 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, dir
 		return fmt.Errorf("restoring container %q: %v", cid, err)
 	}
 
+	return nil
+}
+
+// RestoreSubcontainer sends the restore call for a sub-container in the sandbox.
+func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []boot.GoferMountConf) error {
+	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
+
+	if err := s.configureStdios(conf, stdios); err != nil {
+		return err
+	}
+	s.fixPidns(spec)
+
+	// The payload contains (in this specific order):
+	// * stdin/stdout/stderr (optional: only present when not using TTY)
+	// * The subcontainer's overlay filestore files (optional: only present when
+	//   host file backed overlay is configured)
+	// * Gofer files.
+	payload := urpc.FilePayload{}
+	payload.Files = append(payload.Files, stdios...)
+	payload.Files = append(payload.Files, goferFilestoreFiles...)
+	if devIOFile != nil {
+		payload.Files = append(payload.Files, devIOFile)
+	}
+	payload.Files = append(payload.Files, goferFiles...)
+
+	// Start running the container.
+	args := boot.StartArgs{
+		Spec:                 spec,
+		Conf:                 conf,
+		CID:                  cid,
+		NumGoferFilestoreFDs: len(goferFilestoreFiles),
+		IsDevIoFilePresent:   devIOFile != nil,
+		GoferMountConfs:      goferMountConf,
+		FilePayload:          payload,
+	}
+	if err := s.call(boot.ContMgrRestoreSubcontainer, &args, nil); err != nil {
+		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
+	}
 	return nil
 }
 
@@ -727,9 +771,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		if err := donations.DonateDebugLogFile("coverage-fd", covFilename, "cov", test); err != nil {
 			return err
 		}
-	}
-	if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
-		return err
 	}
 
 	// Relay all the config flags to the sandbox process.
@@ -1031,6 +1072,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// Note: this must be done right after "cmd.SysProcAttr.Ctty" is set above
 	// because it relies on stdin being the next FD donated.
 	donations.Donate("stdio-fds", stdios[:]...)
+	if conf.ProfilingMetricsLog == "-" {
+		donations.Donate("profiling-metrics-fd", stdios[1])
+	} else {
+		if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
+			return err
+		}
+	}
 
 	totalSysMem, err := totalSystemMemory()
 	if err != nil {
@@ -1303,7 +1351,13 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, options statefile.Opt
 			return fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
 		}
 		defer pf.Close()
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+		pagesMetadataFilePath := filepath.Join(imagePath, boot.CheckpointPagesMetadataFileName)
+		pmf, err := os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
+		}
+		defer pmf.Close()
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
 		opt.HavePagesFile = true
 	}
 

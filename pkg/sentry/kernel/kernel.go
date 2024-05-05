@@ -35,7 +35,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -348,9 +347,16 @@ type Kernel struct {
 	// used by processes.
 	MaxFDLimit atomicbitops.Int32
 
-	// devGofers maps container ID to its device gofer client.
+	// devGofers maps containers (using its name) to its device gofer client.
 	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
 	devGofersMu sync.Mutex                      `state:"nosave"`
+
+	// containerNames store the container name based on their container ID.
+	// Names are preserved between save/restore session, while IDs can change.
+	//
+	// Mapping: cid -> name.
+	// It's protected by extMu.
+	containerNames map[string]string
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -457,6 +463,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		args.MaxFDLimit = MaxFdLimit
 	}
 	k.MaxFDLimit.Store(args.MaxFDLimit)
+	k.containerNames = make(map[string]string)
 
 	ctx := k.SupervisorContext()
 	if err := k.vfs.Init(ctx); err != nil {
@@ -573,7 +580,7 @@ func loadPrivateMFs(ctx context.Context, r io.Reader, pr *statefile.AsyncReader)
 // SaveTo saves the state of k to w.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(ctx context.Context, w io.Writer, pagesFile *os.File) error {
+func (k *Kernel) SaveTo(ctx context.Context, w io.Writer, pagesMetadata, pagesFile *fd.FD) error {
 	saveStart := time.Now()
 
 	// Do not allow other Kernel methods to affect it while it's being saved.
@@ -641,14 +648,18 @@ func (k *Kernel) SaveTo(ctx context.Context, w io.Writer, pagesFile *os.File) er
 
 	// Save the memory files' state.
 	memoryStart := time.Now()
-	pw := io.Writer(w)
+	pmw := w
+	if pagesMetadata != nil {
+		pmw = pagesMetadata
+	}
+	pw := w
 	if pagesFile != nil {
 		pw = pagesFile
 	}
-	if err := k.mf.SaveTo(ctx, w, pw); err != nil {
+	if err := k.mf.SaveTo(ctx, pmw, pw); err != nil {
 		return err
 	}
-	if err := savePrivateMFs(ctx, w, pw, mfsToSave); err != nil {
+	if err := savePrivateMFs(ctx, pmw, pw, mfsToSave); err != nil {
 		return err
 	}
 	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
@@ -684,8 +695,25 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 }
 
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesFile *fd.FD, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pagesFile *fd.FD, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
 	loadStart := time.Now()
+
+	var (
+		mfLoadWg  sync.WaitGroup
+		mfLoadErr error
+	)
+	parallelMfLoad := pagesMetadata != nil && pagesFile != nil
+	if parallelMfLoad {
+		// Parallelize MemoryFile load and kernel load. Both are independent.
+		mfLoadWg.Add(1)
+		go func() {
+			defer mfLoadWg.Done()
+			mfLoadErr = k.loadMemoryFiles(ctx, r, pagesMetadata, pagesFile)
+		}()
+		// Defer a Wait() so we wait for k.loadMemoryFiles() to complete even if we
+		// error out without reaching the other Wait() below.
+		defer mfLoadWg.Wait()
+	}
 
 	k.runningTasksCond.L = &k.runningTasksMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
@@ -720,30 +748,18 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesFile *fd.FD, ti
 	log.Infof("Kernel load stats: %s", stats.String())
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
 
+	if parallelMfLoad {
+		mfLoadWg.Wait()
+	} else {
+		mfLoadErr = k.loadMemoryFiles(ctx, r, pagesMetadata, pagesFile)
+	}
+	if mfLoadErr != nil {
+		return mfLoadErr
+	}
+
 	// rootNetworkNamespace should be populated after loading the state file.
 	// Restore the root network stack.
 	k.rootNetworkNamespace.RestoreRootStack(net)
-
-	// Load the memory files' state.
-	memoryStart := time.Now()
-	var pr *statefile.AsyncReader
-	if pagesFile != nil {
-		pr = statefile.NewAsyncReader(pagesFile, 0 /* off */)
-	}
-	if err := k.mf.LoadFrom(ctx, r, pr); err != nil {
-		return err
-	}
-	if err := loadPrivateMFs(ctx, r, pr); err != nil {
-		return err
-	}
-	if pr != nil {
-		if err := pr.Close(); err != nil {
-			return err
-		}
-	}
-	log.Infof("Memory files load took [%s].", time.Since(memoryStart))
-
-	log.Infof("Overall load took [%s]", time.Since(loadStart))
 
 	k.Timekeeper().SetClocks(clocks)
 
@@ -773,6 +789,32 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesFile *fd.FD, ti
 		return fmt.Errorf("UseHostCores enabled: can't increase ApplicationCores from %d to %d after restore", k.applicationCores, initAppCores)
 	}
 
+	return nil
+}
+
+func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader, pagesMetadata, pagesFile *fd.FD) error {
+	// Load the memory files' state.
+	memoryStart := time.Now()
+	pmr := r
+	if pagesMetadata != nil {
+		pmr = pagesMetadata
+	}
+	var pr *statefile.AsyncReader
+	if pagesFile != nil {
+		pr = statefile.NewAsyncReader(pagesFile, 0 /* off */)
+	}
+	if err := k.mf.LoadFrom(ctx, pmr, pr); err != nil {
+		return err
+	}
+	if err := loadPrivateMFs(ctx, pmr, pr); err != nil {
+		return err
+	}
+	if pr != nil {
+		if err := pr.Close(); err != nil {
+			return err
+		}
+	}
+	log.Infof("Memory files load took [%s].", time.Since(memoryStart))
 	return nil
 }
 
@@ -901,7 +943,7 @@ func (ctx *createProcessContext) Value(key any) any {
 		mntns.IncRef()
 		return mntns
 	case devutil.CtxDevGoferClient:
-		return ctx.kernel.getDevGoferClient(ctx.args.ContainerID)
+		return ctx.kernel.getDevGoferClient(ctx.kernel.ContainerName(ctx.args.ContainerID))
 	case inet.CtxStack:
 		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -1934,8 +1976,8 @@ func (k *Kernel) GetUserCounters(uid auth.KUID) *UserCounters {
 
 // AddDevGofer initializes the dev gofer connection and starts tracking it.
 // It takes ownership of goferFD.
-func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
-	client, err := devutil.NewGoferClient(k.SupervisorContext(), goferFD)
+func (k *Kernel) AddDevGofer(contName string, goferFD int) error {
+	client, err := devutil.NewGoferClient(k.SupervisorContext(), contName, goferFD)
 	if err != nil {
 		return err
 	}
@@ -1945,27 +1987,27 @@ func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
 	if k.devGofers == nil {
 		k.devGofers = make(map[string]*devutil.GoferClient)
 	}
-	k.devGofers[cid] = client
+	k.devGofers[contName] = client
 	return nil
 }
 
 // RemoveDevGofer closes the dev gofer connection, if one exists, and stops
 // tracking it.
-func (k *Kernel) RemoveDevGofer(cid string) {
+func (k *Kernel) RemoveDevGofer(contName string) {
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
-	client, ok := k.devGofers[cid]
+	client, ok := k.devGofers[contName]
 	if !ok {
 		return
 	}
 	client.Close()
-	delete(k.devGofers, cid)
+	delete(k.devGofers, contName)
 }
 
-func (k *Kernel) getDevGoferClient(cid string) *devutil.GoferClient {
+func (k *Kernel) getDevGoferClient(contName string) *devutil.GoferClient {
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
-	return k.devGofers[cid]
+	return k.devGofers[contName]
 }
 
 func (k *Kernel) cleaupDevGofers() {
@@ -1975,4 +2017,32 @@ func (k *Kernel) cleaupDevGofers() {
 		client.Close()
 	}
 	k.devGofers = nil
+}
+
+// RegisterContainerName registers a container name for a given container ID.
+func (k *Kernel) RegisterContainerName(cid, containerName string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	k.containerNames[cid] = containerName
+}
+
+// RestoreContainerMapping remaps old container IDs to new ones after a restore.
+// containerIDs maps "name -> new container ID". Note that container names remain
+// constant between restore sessions.
+func (k *Kernel) RestoreContainerMapping(containerIDs map[string]string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+
+	// Delete mapping from old session and replace with new values.
+	k.containerNames = make(map[string]string)
+	for name, cid := range containerIDs {
+		k.containerNames[cid] = name
+	}
+}
+
+// ContainerName returns the container name for a given container ID.
+func (k *Kernel) ContainerName(cid string) string {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	return k.containerNames[cid]
 }
