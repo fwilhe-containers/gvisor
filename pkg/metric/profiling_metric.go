@@ -21,6 +21,8 @@ import (
 	"hash"
 	"hash/adler32"
 	"io"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -31,8 +33,17 @@ import (
 )
 
 const (
-	snapshotBufferSize     = 1000
-	snapshotRingbufferSize = 16
+	// snapshotBufferSize is the number of snapshots within one item of the
+	// ringbuffer. Increasing this number means less context-switching
+	// overhead between collector and writer goroutines, but worse time
+	// precision, as the precise time is refreshed every this many snapshots.
+	snapshotBufferSize = 1024
+	// snapshotRingbufferSize is the number of items in the ringbuffer.
+	// Increasing this number means the writer has more slack to catch up
+	// if it falls behind, but it also means that the collector may need
+	// to wait for longer intervals when the writer does fall behind,
+	// adding more variance to the time gaps between collections.
+	snapshotRingbufferSize = 128
 	// MetricsPrefix is prepended before every metrics line.
 	MetricsPrefix = "GVISOR_METRICS\t"
 	// MetricsHashIndicator is prepended before the hash of the metrics
@@ -54,7 +65,7 @@ var (
 	profilingMetricsStarted atomicbitops.Bool
 	// stopProfilingMetrics is used to signal to the profiling metrics
 	// goroutine to stop recording and writing metrics.
-	stopProfilingMetrics chan bool
+	stopProfilingMetrics atomicbitops.Bool
 	// doneProfilingMetrics is used to signal that the profiling metrics
 	// goroutines are finished.
 	doneProfilingMetrics chan bool
@@ -67,8 +78,7 @@ var (
 // before it's written to the writer.
 type snapshots struct {
 	numMetrics int
-	// startTime is the time at which collection started, as reported by
-	// CheapNowNano() which does *not* start counting from the epoch time.
+	// startTime is the time at which collection started in nanoseconds.
 	startTime int64
 	// ringbuffer is used to store metric data.
 	ringbuffer [][]uint64
@@ -158,6 +168,9 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 			columnHeaders.WriteString(name)
 			values = append(values, m.value)
 		}
+		if opts.Lossy {
+			columnHeaders.WriteString("\tChecksum")
+		}
 	} else {
 		if len(definedProfilingMetrics) > 0 {
 			return fmt.Errorf("a value for --profiling-metrics was not specified; consider using a subset of '--profiling-metrics=%s'", strings.Join(definedProfilingMetrics, ","))
@@ -185,11 +198,12 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 		s.ringbuffer[i] = make([]uint64, snapshotBufferSize*(numMetrics+1))
 	}
 
-	stopProfilingMetrics = make(chan bool, 1)
+	stopProfilingMetrics = atomicbitops.FromBool(false)
 	doneProfilingMetrics = make(chan bool, 1)
 	writeCh := make(chan writeReq, snapshotRingbufferSize)
-	s.startTime = CheapNowNano()
-	go collectProfilingMetrics(&s, values, opts.Rate, writeCh)
+	s.startTime = time.Now().UnixNano()
+	cheapStartTime := CheapNowNano()
+	go collectProfilingMetrics(&s, values, cheapStartTime, opts.Rate, writeCh)
 	if opts.Lossy {
 		lossySink := newLossyBufferedWriter(opts.Sink)
 		go writeProfilingMetrics[*lossyBufferedWriter[T]](lossySink, &s, headers, writeCh)
@@ -204,57 +218,97 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 
 // collectProfilingMetrics will send metrics to the writeCh until it receives a
 // signal via the stopProfilingMetrics channel.
-func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldValue) uint64, profilingRate time.Duration, writeCh chan<- writeReq) {
+func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldValue) uint64, cheapStartTime int64, profilingRate time.Duration, writeCh chan<- writeReq) {
 	defer close(writeCh)
 
 	numEntries := s.numMetrics + 1 // to account for the timestamp
 	ringbufferIdx := 0
 	curSnapshot := 0
-	// getNewRingbufferIdx will block until the writer indicates that some part
-	// of the ringbuffer is available for writing.
-	getNewRingbufferIdx := func() {
-		for {
-			nextIdx := (ringbufferIdx + 1) % snapshotRingbufferSize
-			if nextIdx != int(s.curWriterIndex.Load()) {
-				ringbufferIdx = nextIdx
-				break
-			}
-			// Going too fast, stop collecting for a bit.
-			log.Warningf("Profiling metrics collector exhausted the entire ringbuffer... backing off to let writer catch up.")
-			time.Sleep(profilingRate * 100)
-		}
-	}
+
+	// If we write faster than the writer can keep up, we back off.
+	// The backoff factor starts small but increases exponentially
+	// each time we find that we are still faster than the writer.
+	const (
+		// How much slower than the profiling rate we sleep for, as a
+		// multiplier for the profiling rate.
+		initialBackoffFactor = 1.0
+
+		// The exponential factor by which the backoff factor increases.
+		backoffFactorGrowth = 1.125
+
+		// The maximum backoff factor, i.e. the maximum multiplier of
+		// the profiling rate for which we sleep.
+		backoffFactorMax = 256.0
+	)
+	backoffFactor := initialBackoffFactor
+
+	// To keep track of time cheaply, we use `CheapNowNano`.
+	// However, this can drift as it has poor precision.
+	// To get something more precise, we periodically call `time.Now`
+	// and `CheapNowNano` and use these two variables to track both.
+	// This way, we can compute a more precise time by using
+	// `CheapNowNano() - cheapTime + preciseTime`.
+	preciseTime := s.startTime
+	cheapTime := cheapStartTime
 
 	stopCollecting := false
-	for nextCollection := CheapNowNano() + profilingRate.Nanoseconds(); !stopCollecting; nextCollection += profilingRate.Nanoseconds() {
-		now := CheapNowNano()
-		if now < nextCollection {
-			time.Sleep(time.Duration(nextCollection-now) * time.Nanosecond)
-		} else {
-			// Skip collection since we just did one anyway.
-			continue
+	for nextCollection := s.startTime; !stopCollecting; nextCollection += profilingRate.Nanoseconds() {
+
+		// For small durations, just spin. Otherwise sleep.
+		for {
+			const (
+				wakeUpNanos   = 10
+				spinMaxNanos  = 250
+				yieldMaxNanos = 1_000
+			)
+			now := CheapNowNano() - cheapTime + preciseTime
+			nanosToNextCollection := nextCollection - now
+			if nanosToNextCollection <= 0 {
+				// Collect now.
+				break
+			}
+			if nanosToNextCollection < spinMaxNanos {
+				continue // Spin.
+			}
+			if nanosToNextCollection < yieldMaxNanos {
+				// Yield then spin.
+				runtime.Gosched()
+				continue
+			}
+			// Sleep.
+			time.Sleep(time.Duration(nanosToNextCollection-wakeUpNanos) * time.Nanosecond)
 		}
 
-		select {
-		case <-stopProfilingMetrics:
+		if stopProfilingMetrics.Load() {
 			stopCollecting = true
 			// Collect one last time before stopping.
-		default:
 		}
 
-		collectStart := CheapNowNano()
+		collectStart := CheapNowNano() - cheapTime + preciseTime
 		timestamp := time.Duration(collectStart - s.startTime)
 		base := curSnapshot * numEntries
-		s.ringbuffer[ringbufferIdx][base] = uint64(timestamp)
+		ringBuf := s.ringbuffer[ringbufferIdx]
+		ringBuf[base] = uint64(timestamp)
 		for i := 1; i < numEntries; i++ {
-			s.ringbuffer[ringbufferIdx][base+i] = values[i-1]()
+			ringBuf[base+i] = values[i-1]()
 		}
 		curSnapshot++
 
 		if curSnapshot == snapshotBufferSize {
 			writeCh <- writeReq{ringbufferIdx: ringbufferIdx, numLines: curSnapshot}
 			curSnapshot = 0
-			getNewRingbufferIdx()
+			// Block until the writer indicates that this part of the ringbuffer
+			// is available for writing.
+			for ringbufferIdx = (ringbufferIdx + 1) % snapshotRingbufferSize; ringbufferIdx == int(s.curWriterIndex.Load()); {
+				// Going too fast, stop collecting for a bit.
+				backoffSleep := profilingRate * time.Duration(backoffFactor)
+				log.Warningf("Profiling metrics collector exhausted the entire ringbuffer... backing off for %v to let writer catch up.", backoffSleep)
+				time.Sleep(backoffSleep)
+				backoffFactor = min(backoffFactor*backoffFactorGrowth, backoffFactorMax)
+			}
+			// Refresh precise time.
+			preciseTime = time.Now().UnixNano()
+			cheapTime = CheapNowNano()
 		}
 	}
 	if curSnapshot != 0 {
@@ -336,22 +390,27 @@ func (w *bufferedWriter[T]) Close() error {
 // The checksum covers all of the per-line data written after the line prefix,
 // including the newline character of these lines, with the exception of
 // the checksum data line itself.
+// All lines are also checksummed individually, with the checksum covering
+// the contents of the line after the line prefix but before the tab and
+// line checksum itself at the end of the line.
 // `lossyBufferedWriter` implements `bufferedMetricsWriter`.
 type lossyBufferedWriter[T ProfilingMetricsWriter] struct {
-	lineBuf     bytes.Buffer
-	flushBuf    bytes.Buffer
-	hasher      hash.Hash32
-	lines       int
-	longestLine int
-	underlying  T
+	lineBuf       bytes.Buffer
+	flushBuf      bytes.Buffer
+	lineHasher    hash.Hash32
+	overallHasher hash.Hash32
+	lines         int
+	longestLine   int
+	underlying    T
 }
 
 // newLossyBufferedWriter creates a new lossyBufferedWriter.
 func newLossyBufferedWriter[T ProfilingMetricsWriter](underlying T) *lossyBufferedWriter[T] {
 	w := &lossyBufferedWriter[T]{
-		underlying:  underlying,
-		hasher:      adler32.New(),
-		longestLine: lineBufSize,
+		underlying:    underlying,
+		lineHasher:    adler32.New(),
+		overallHasher: adler32.New(),
+		longestLine:   lineBufSize,
 	}
 	w.lineBuf.Grow(lineBufSize)
 
@@ -376,6 +435,10 @@ func (w *lossyBufferedWriter[T]) Flush() {
 		// have clean line endings a the time we print this.
 		w.flushBuf.WriteString("\n")
 		w.underlying.WriteString(w.flushBuf.String())
+		if f, isFile := any(w.underlying).(*os.File); isFile {
+			// If we're dealing with a file, also call `sync(2)`.
+			f.Sync()
+		}
 		w.flushBuf.Reset()
 		w.flushBuf.WriteString("\n")
 		w.lines = 0
@@ -384,7 +447,6 @@ func (w *lossyBufferedWriter[T]) Flush() {
 
 // NewLine implements bufferedMetricsWriter.NewLine.
 func (w *lossyBufferedWriter[T]) NewLine() {
-	w.lineBuf.WriteString("\n")
 	if lineLen := w.lineBuf.Len(); lineLen > w.longestLine {
 		wantTotalSize := (lineLen+1)*bufferedLines + 2
 		if growBy := wantTotalSize - w.flushBuf.Len(); growBy > 0 {
@@ -393,15 +455,23 @@ func (w *lossyBufferedWriter[T]) NewLine() {
 		w.longestLine = lineLen
 	}
 	line := w.lineBuf.String()
+	w.lineHasher.Reset()
+	w.lineHasher.Write([]byte(line))
+	lineHash := w.lineHasher.Sum32()
 	w.lineBuf.Reset()
 	w.flushBuf.WriteString(MetricsPrefix)
+	beforeLineIndex := w.flushBuf.Len()
 	w.flushBuf.WriteString(line)
+	w.flushBuf.WriteString("\t0x")
+	prometheus.WriteHex(&w.flushBuf, uint64(lineHash))
+	w.flushBuf.WriteString("\n")
+	afterLineIndex := w.flushBuf.Len()
 	// We ignore the effects that partial writes on the underlying writer
 	// would have on the hash computation here.
 	// This is OK because the goal of this writer is speed over correctness,
 	// and correctness is enforced by the reader of this data checking the
 	// hash at the end.
-	w.hasher.Write([]byte(line))
+	w.overallHasher.Write(w.flushBuf.Bytes()[beforeLineIndex:afterLineIndex])
 	w.lineBuf.Reset()
 	w.lines++
 	if w.lines >= bufferedLines || w.flushBuf.Len() >= bufSize {
@@ -414,9 +484,12 @@ func (w *lossyBufferedWriter[T]) NewLine() {
 func (w *lossyBufferedWriter[T]) Close() error {
 	w.Flush()
 	w.flushBuf.WriteString(MetricsPrefix)
-	w.flushBuf.WriteString(fmt.Sprintf("%s0x%x\n", MetricsHashIndicator, w.hasher.Sum32()))
+	w.flushBuf.WriteString(MetricsHashIndicator)
+	w.flushBuf.WriteString("0x")
+	prometheus.WriteHex(&w.flushBuf, uint64(w.overallHasher.Sum32()))
+	w.flushBuf.WriteString("\n")
 	w.underlying.WriteString(w.flushBuf.String())
-	w.hasher.Reset()
+	w.overallHasher.Reset()
 	w.lineBuf.Reset()
 	w.flushBuf.Reset()
 	return w.underlying.Close()
@@ -432,14 +505,15 @@ func writeProfilingMetrics[T bufferedMetricsWriter](sink T, s *snapshots, header
 	}
 	for req := range writeReqs {
 		s.curWriterIndex.Store(int32(req.ringbufferIdx))
+		ringBuf := s.ringbuffer[req.ringbufferIdx]
 		for i := 0; i < req.numLines; i++ {
 			base := i * numEntries
 			// Write the time
-			prometheus.WriteInteger(sink, int64(s.ringbuffer[req.ringbufferIdx][base]))
+			prometheus.WriteInteger(sink, int64(ringBuf[base]))
 			// Then everything else
 			for j := 1; j < numEntries; j++ {
 				sink.WriteString("\t")
-				prometheus.WriteInteger(sink, int64(s.ringbuffer[req.ringbufferIdx][base+j]))
+				prometheus.WriteInteger(sink, int64(ringBuf[base+j]))
 			}
 			sink.NewLine()
 		}
@@ -458,10 +532,9 @@ func StopProfilingMetrics() {
 	if !profilingMetricsStarted.Load() {
 		return
 	}
-
-	select {
-	case stopProfilingMetrics <- true:
+	if stopProfilingMetrics.CompareAndSwap(false, true) {
 		<-doneProfilingMetrics
-	default: // Stop signal was already sent
 	}
+	// If the CAS fails, this means the signal was already sent,
+	// so don't wait on doneProfilingMetrics.
 }

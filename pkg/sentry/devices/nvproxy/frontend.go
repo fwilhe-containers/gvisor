@@ -268,15 +268,18 @@ func frontendRegisterFD(fi *frontendIoctlState) (uintptr, error) {
 	return frontendIoctlInvoke(fi, &ioctlParams)
 }
 
-func rmAllocOSEvent(fi *frontendIoctlState) (uintptr, error) {
-	var ioctlParams nvgpu.IoctlAllocOSEvent
-	if fi.ioctlParamsSize != nvgpu.SizeofIoctlAllocOSEvent {
+func frontendIoctHasFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParamsValue Params
+	ioctlParams := PtrParams(&ioctlParamsValue)
+	if int(fi.ioctlParamsSize) != ioctlParams.SizeBytes() {
 		return 0, linuxerr.EINVAL
 	}
 	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
 		return 0, err
 	}
-	eventFileGeneric, _ := fi.t.FDTable().Get(int32(ioctlParams.FD))
+
+	origFD := ioctlParams.GetFrontendFD()
+	eventFileGeneric, _ := fi.t.FDTable().Get(origFD)
 	if eventFileGeneric == nil {
 		return 0, linuxerr.EINVAL
 	}
@@ -286,51 +289,15 @@ func rmAllocOSEvent(fi *frontendIoctlState) (uintptr, error) {
 		return 0, linuxerr.EINVAL
 	}
 
-	origFD := ioctlParams.FD
-	ioctlParams.FD = uint32(eventFile.hostFD)
-	n, err := frontendIoctlInvoke(fi, &ioctlParams)
-	ioctlParams.FD = origFD
+	ioctlParams.SetFrontendFD(eventFile.hostFD)
+	n, err := frontendIoctlInvoke(fi, ioctlParams)
+	ioctlParams.SetFrontendFD(origFD)
 	if err != nil {
 		return n, err
 	}
-
 	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
 		return n, err
 	}
-
-	return n, nil
-}
-
-func rmFreeOSEvent(fi *frontendIoctlState) (uintptr, error) {
-	var ioctlParams nvgpu.IoctlFreeOSEvent
-	if fi.ioctlParamsSize != nvgpu.SizeofIoctlFreeOSEvent {
-		return 0, linuxerr.EINVAL
-	}
-	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
-		return 0, err
-	}
-	eventFileGeneric, _ := fi.t.FDTable().Get(int32(ioctlParams.FD))
-	if eventFileGeneric == nil {
-		return 0, linuxerr.EINVAL
-	}
-	defer eventFileGeneric.DecRef(fi.ctx)
-	eventFile, ok := eventFileGeneric.Impl().(*frontendFD)
-	if !ok {
-		return 0, linuxerr.EINVAL
-	}
-
-	origFD := ioctlParams.FD
-	ioctlParams.FD = uint32(eventFile.hostFD)
-	n, err := frontendIoctlInvoke(fi, &ioctlParams)
-	ioctlParams.FD = origFD
-	if err != nil {
-		return n, err
-	}
-
-	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
-		return n, err
-	}
-
 	return n, nil
 }
 
@@ -561,15 +528,18 @@ func ctrlCmdFailWithStatus(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Para
 	return err
 }
 
-func ctrlExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
-	var ctrlParams nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS
+func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParamsValue Params
+	ctrlParams := PtrParams(&ctrlParamsValue)
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
 		return 0, linuxerr.EINVAL
 	}
 	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return 0, err
 	}
-	ctlFileGeneric, _ := fi.t.FDTable().Get(ctrlParams.FD)
+
+	origFD := ctrlParams.GetFrontendFD()
+	ctlFileGeneric, _ := fi.t.FDTable().Get(origFD)
 	if ctlFileGeneric == nil {
 		return 0, linuxerr.EINVAL
 	}
@@ -579,10 +549,9 @@ func ctrlExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Param
 		return 0, linuxerr.EINVAL
 	}
 
-	origFD := ctrlParams.FD
-	ctrlParams.FD = ctlFile.hostFD
-	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
-	ctrlParams.FD = origFD
+	ctrlParams.SetFrontendFD(ctlFile.hostFD)
+	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	ctrlParams.SetFrontendFD(origFD)
 	if err != nil {
 		return n, err
 	}
@@ -767,8 +736,8 @@ func rmAlloc(fi *frontendIoctlState) (uintptr, error) {
 //
 // Unlike frontendIoctlSimple and rmControlSimple, rmAllocSimple requires the
 // parameter type since the parameter's size is otherwise unknown.
-func rmAllocSimple[Params any, PParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, isNVOS64 bool) (uintptr, error) {
-	return rmAllocSimpleParams[Params, PParams](fi, ioctlParams, isNVOS64, addSimpleObjDepParentLocked)
+func rmAllocSimple[Params any, PtrParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams[Params, PtrParams](fi, ioctlParams, isNVOS64, addSimpleObjDepParentLocked)
 }
 
 // addSimpleObjDepParentLocked implements rmAllocInvoke.addObjLocked for
@@ -777,20 +746,21 @@ func addSimpleObjDepParentLocked[Params any](fi *frontendIoctlState, ioctlParams
 	fi.fd.dev.nvp.objAdd(fi.ctx, ioctlParams.HRoot, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent)
 }
 
-func rmAllocSimpleParams[Params any, PParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, isNVOS64 bool, objAddLocked func(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params)) (uintptr, error) {
+func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, isNVOS64 bool, objAddLocked func(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params)) (uintptr, error) {
 	if ioctlParams.PAllocParms == 0 {
 		return rmAllocInvoke[Params](fi, ioctlParams, nil, isNVOS64, objAddLocked)
 	}
 
-	var allocParams Params
-	if _, err := (PParams)(&allocParams).CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+	var allocParamsValue Params
+	allocParams := PtrParams(&allocParamsValue)
+	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return 0, err
 	}
-	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, objAddLocked)
+	n, err := rmAllocInvoke(fi, ioctlParams, allocParams, isNVOS64, objAddLocked)
 	if err != nil {
 		return n, err
 	}
-	if _, err := (PParams)(&allocParams).CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return n, err
 	}
 	return n, nil
