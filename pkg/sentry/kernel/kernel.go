@@ -806,6 +806,7 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader, pagesMetadata
 	var pr *statefile.AsyncReader
 	if pagesFile != nil {
 		pr = statefile.NewAsyncReader(pagesFile, 0 /* off */)
+		defer pr.Close()
 	}
 	if err := k.mf.LoadFrom(ctx, pmr, pr); err != nil {
 		return err
@@ -814,7 +815,7 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader, pagesMetadata
 		return err
 	}
 	if pr != nil {
-		if err := pr.Close(); err != nil {
+		if err := pr.Wait(); err != nil {
 			return err
 		}
 	}
@@ -1214,10 +1215,11 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.PauseTimer()
 				}
+				return true
 			})
 		}
 	}
@@ -1244,10 +1246,11 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.ResumeTimer()
 				}
+				return true
 			})
 		}
 	}
