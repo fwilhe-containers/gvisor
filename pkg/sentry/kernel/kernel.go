@@ -361,6 +361,14 @@ type Kernel struct {
 	// additionalCheckpointState stores additional state that needs
 	// to be checkpointed. It's protected by extMu.
 	additionalCheckpointState map[any]any
+
+	// Saver registers someone that knows how to save the kernel.
+	saver Saver `state:"nosave"`
+}
+
+// Saver is an interface for saving the kernel.
+type Saver interface {
+	SaveAsync(done func()) error
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -1910,6 +1918,7 @@ func (k *Kernel) Release() {
 	k.rootIPCNamespace.DecRef(ctx)
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
+	k.mf.Destroy()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -2085,4 +2094,16 @@ func (k *Kernel) ContainerName(cid string) string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return k.containerNames[cid]
+}
+
+// SetSaver sets the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) SetSaver(s Saver) {
+	k.saver = s
+}
+
+// Saver returns the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) Saver() Saver {
+	return k.saver
 }
