@@ -20,18 +20,14 @@ package sharedmem
 import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type serverEndpoint struct {
-	// mtu (maximum transmission unit) is the maximum size of a packet.
-	// mtu is immutable.
-	mtu uint32
-
 	// bufferSize is the size of each individual buffer.
 	// bufferSize is immutable.
 	bufferSize uint32
@@ -80,6 +76,9 @@ type serverEndpoint struct {
 	//
 	// +checklocks:mu
 	addr tcpip.LinkAddress
+	// mtu (maximum transmission unit) is the maximum size of a packet.
+	// +checklocks:mu
+	mtu uint32
 }
 
 // NewServerEndpoint creates a new shared-memory-based endpoint. Buffers will be
@@ -159,9 +158,13 @@ func (e *serverEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 				// When sharedmem endpoint is in use the peerFD is never used for any
 				// data transfer and this Read should only return if the peer is
 				// shutting down.
-				_, err := rawfile.BlockingRead(e.peerFD, b)
+				_, errno := rawfile.BlockingRead(e.peerFD, b)
 				if e.onClosed != nil {
-					e.onClosed(err)
+					if errno == 0 {
+						e.onClosed(nil)
+					} else {
+						e.onClosed(tcpip.TranslateErrno(errno))
+					}
 				}
 				e.completed.Done()
 			}()
@@ -180,10 +183,17 @@ func (e *serverEndpoint) IsAttached() bool {
 	return e.workerStarted
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *serverEndpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+func (e *serverEndpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.

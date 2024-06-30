@@ -204,6 +204,10 @@ type Loader struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	// hostShmemHuge is the host's value of
+	// /sys/kernel/mm/transparent_hugepage/shmem_enabled.
+	hostShmemHuge string
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
@@ -340,6 +344,10 @@ type Args struct {
 	// NvidiaDriverVersion is the NVIDIA driver ABI version to use for
 	// communicating with NVIDIA devices on the host.
 	NvidiaDriverVersion string
+	// HostShmemHuge is the host's value of
+	// /sys/kernel/mm/transparent_hugepage/shmem_enabled, or empty if this is
+	// unknown.
+	HostShmemHuge string
 
 	SaveFDs []*fd.FD
 }
@@ -409,6 +417,7 @@ func New(args Args) (*Loader, error) {
 		sharedMounts:  make(map[string]*vfs.Mount),
 		stopProfiling: stopProfiling,
 		productName:   args.ProductName,
+		hostShmemHuge: args.HostShmemHuge,
 		containerIDs:  map[string]string{},
 		saveFDs:       args.SaveFDs,
 	}
@@ -476,7 +485,7 @@ func New(args Args) (*Loader, error) {
 	l.k = &kernel.Kernel{Platform: p}
 
 	// Create memory file.
-	mf, err := createMemoryFile()
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostShmemHuge)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -491,8 +500,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create timekeeper.
-	tk := kernel.NewTimekeeper(l.k.MemoryFile(), vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks())
+	tk := kernel.NewTimekeeper()
+	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+	tk.SetClocks(time.NewCalibratedClocks(), params)
 
 	if err := enableStrace(args.Conf); err != nil {
 		return nil, fmt.Errorf("enabling strace: %w", err)
@@ -503,7 +513,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("getting root credentials")
 	}
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, tk, l.k, creds.UserNamespace)
+	netns, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}
@@ -550,6 +560,7 @@ func New(args Args) (*Loader, error) {
 		RootNetworkNamespace: netns,
 		ApplicationCores:     uint(args.NumCPU),
 		Vdso:                 vdso,
+		VdsoParams:           params,
 		RootUTSNamespace:     kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Hostname, creds.UserNamespace),
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		PIDNamespace:         kernel.NewRootPIDNamespace(creds.UserNamespace),
@@ -736,17 +747,45 @@ func createPlatform(conf *config.Config, deviceFile *fd.FD) (platform.Platform, 
 	return p.New(deviceFile)
 }
 
-func createMemoryFile() (*pgalloc.MemoryFile, error) {
+func createMemoryFile(appHugePages bool, hostShmemHuge string) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error creating memfd: %w", err)
 	}
 	memfile := os.NewFile(uintptr(memfd), memfileName)
-	// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
-	// there are memory cgroups specified, because at this point we're already
-	// in a mount namespace in which the relevant cgroupfs is not visible.
-	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{})
+
+	mfopts := pgalloc.MemoryFileOpts{
+		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
+		// there are memory cgroups specified, because at this point we're already
+		// in a mount namespace in which the relevant cgroupfs is not visible.
+	}
+	if appHugePages {
+		switch hostShmemHuge {
+		case "":
+			log.Infof("Disabling application huge pages: host shmem_huge is unknown")
+		case "never", "deny":
+			log.Infof("Disabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+		case "advise":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			mfopts.ExpectHugepages = true
+			mfopts.AdviseHugepage = true
+		case "always", "within_size":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			// In these cases, memfds will default to using huge pages, and we have to
+			// explicitly ask for small pages.
+			mfopts.ExpectHugepages = true
+			mfopts.AdviseNoHugepage = true
+		case "force":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			// The kernel will ignore MADV_NOHUGEPAGE, so don't bother.
+			mfopts.ExpectHugepages = true
+		default:
+			log.Infof("Disabling application huge pages: host shmem_huge is unknown value %q", hostShmemHuge)
+		}
+	}
+
+	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
 	if err != nil {
 		_ = memfile.Close()
 		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
@@ -1381,7 +1420,7 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	return l.k.GlobalInit().ExitStatus()
 }
 
-func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID stack.UniqueID, userns *auth.UserNamespace) (*inet.Namespace, error) {
+func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace) (*inet.Namespace, error) {
 	// Create an empty network stack because the network namespace may be empty at
 	// this point. Netns is configured before Run() is called. Netstack is
 	// configured using a control uRPC message. Host network is configured inside
@@ -1398,13 +1437,12 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
 
 	case config.NetworkNone, config.NetworkSandbox:
-		s, err := newEmptySandboxNetworkStack(clock, uniqueID, conf.AllowPacketEndpointWrite)
+		s, err := newEmptySandboxNetworkStack(clock, conf.AllowPacketEndpointWrite)
 		if err != nil {
 			return nil, err
 		}
 		creator := &sandboxNetstackCreator{
 			clock:                    clock,
-			uniqueID:                 uniqueID,
 			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 		}
 		return inet.NewRootNamespace(s, creator, userns), nil
@@ -1415,7 +1453,7 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 
 }
 
-func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, allowPacketEndpointWrite bool) (inet.Stack, error) {
+func newEmptySandboxNetworkStack(clock tcpip.Clock, allowPacketEndpointWrite bool) (*netstack.Stack, error) {
 	netProtos := []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol}
 	transProtos := []stack.TransportProtocolFactory{
 		tcp.NewProtocol,
@@ -1433,7 +1471,6 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, all
 		// privileges.
 		RawFactory:               raw.EndpointFactory{},
 		AllowPacketEndpointWrite: allowPacketEndpointWrite,
-		UniqueID:                 uniqueID,
 		DefaultIPTables:          netfilter.DefaultLinuxTables,
 	})}
 
@@ -1472,20 +1509,22 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, all
 // +stateify savable
 type sandboxNetstackCreator struct {
 	clock                    tcpip.Clock
-	uniqueID                 stack.UniqueID
 	allowPacketEndpointWrite bool
 }
 
 // CreateStack implements kernel.NetworkStackCreator.CreateStack.
 func (f *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
-	s, err := newEmptySandboxNetworkStack(f.clock, f.uniqueID, f.allowPacketEndpointWrite)
+	s, err := newEmptySandboxNetworkStack(f.clock, f.allowPacketEndpointWrite)
 	if err != nil {
 		return nil, err
 	}
 
 	// Setup loopback.
-	n := &Network{Stack: s.(*netstack.Stack).Stack}
-	nicID := tcpip.NICID(f.uniqueID.UniqueID())
+	n := &Network{Stack: s.Stack}
+	nicID := s.Stack.NextNICID()
+	if nicID != linux.LOOPBACK_IFINDEX {
+		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
+	}
 	link := DefaultLoopbackLink
 	linkEP := ethernet.New(loopback.New())
 	opts := stack.NICOptions{

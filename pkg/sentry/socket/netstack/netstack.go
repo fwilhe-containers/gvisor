@@ -80,13 +80,21 @@ func statCounterValue(cm *tcpip.StatCounter) func(...*metric.FieldValue) uint64 
 
 func mustCreateMetric(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, true /* cumulative */, false /* sync */, description, statCounterValue(&cm))
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
 func mustCreateGauge(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, false /* cumulative */, false /* sync */, description, statCounterValue(&cm))
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  false,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
@@ -1564,7 +1572,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int
 // getSockOptIP implements GetSockOpt when level is SOL_IP.
 func getSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int, _ int) (marshal.Marshallable, *syserr.Error) {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return nil, syserr.ErrUnknownProtocolOption
 	}
 
@@ -2422,7 +2430,7 @@ func parseIntOrChar(buf []byte) (int32, *syserr.Error) {
 // setSockOptIP implements SetSockOpt when level is SOL_IP.
 func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return syserr.ErrUnknownProtocolOption
 	}
 

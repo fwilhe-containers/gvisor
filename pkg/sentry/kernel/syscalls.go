@@ -392,7 +392,15 @@ func RegisterSyscallTable(s *SyscallTable) {
 			unimplementedSyscallNumbers[i] = []*metric.FieldValue{s}
 		}
 		allowedValues[len(allowedValues)-1] = outOfRangeSyscallNumber[0]
-		unimplementedSyscallCounter = metric.MustCreateNewUint64Metric("/unimplemented_syscalls", true, "Number of times the application tried to call an unimplemented syscall, broken down by syscall number", metric.NewField("sysno", allowedValues...))
+		unimplementedSyscallCounter = metric.MustCreateNewUint64Metric("/unimplemented_syscalls",
+			metric.Uint64Metadata{
+				Cumulative:  true,
+				Sync:        true,
+				Description: "Number of times the application tried to call an unimplemented syscall, broken down by syscall number",
+				Fields: []metric.Field{
+					metric.NewField("sysno", allowedValues...),
+				},
+			})
 	})
 	s.Init()
 }
@@ -488,7 +496,10 @@ type SyscallInfo struct {
 // IncrementUnimplementedSyscallCounter increments the "unimplemented syscall" metric for the given
 // syscall number.
 // A syscall table must have been initialized prior to calling this function.
-// +checkescape:all
+//
+// FIXME(gvisor.dev/issue/10556): checkescape can't distinguish between this
+// file and files named syscalls.go in other directories, resulting in false
+// positives, so this function cannot be +checkescape:all.
 //
 //go:nosplit
 func IncrementUnimplementedSyscallCounter(sysno uintptr) {

@@ -47,10 +47,10 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -120,9 +120,6 @@ type endpoint struct {
 	// hash outbound packets to specific channels based on the packet hash.
 	fds []fdInfo
 
-	// mtu (maximum transmission unit) is the maximum size of a packet.
-	mtu uint32
-
 	// hdrSize specifies the link-layer header size. If set to 0, no header
 	// is added/removed; otherwise an ethernet header is used.
 	hdrSize int
@@ -172,6 +169,10 @@ type endpoint struct {
 	//
 	// +checklocks:mu
 	addr tcpip.LinkAddress
+
+	// mtu (maximum transmission unit) is the maximum size of a packet.
+	// +checklocks:mu
+	mtu uint32
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -454,10 +455,18 @@ func (e *endpoint) IsAttached() bool {
 	return e.dispatcher != nil
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU.
+func (e *endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -613,7 +622,10 @@ func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	for _, v := range views {
 		iovecs = rawfile.AppendIovecFromBytes(iovecs, v, numIovecs)
 	}
-	return rawfile.NonBlockingWriteIovec(fd, iovecs)
+	if errno := rawfile.NonBlockingWriteIovec(fd, iovecs); errno != 0 {
+		return tcpip.TranslateErrno(errno)
+	}
+	return nil
 }
 
 func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (int, tcpip.Error) {
@@ -720,9 +732,9 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 			packets++
 		} else {
 			for len(mmsgHdrs) > 0 {
-				sent, err := rawfile.NonBlockingSendMMsg(batchFD, mmsgHdrs)
-				if err != nil {
-					return packets, err
+				sent, errno := rawfile.NonBlockingSendMMsg(batchFD, mmsgHdrs)
+				if errno != 0 {
+					return packets, tcpip.TranslateErrno(errno)
 				}
 				packets += sent
 				mmsgHdrs = mmsgHdrs[sent:]
@@ -777,7 +789,10 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 
 // InjectOutbound implements stack.InjectableEndpoint.InjectOutbound.
 func (e *endpoint) InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip.Error {
-	return rawfile.NonBlockingWrite(e.fds[0].fd, packet.AsSlice())
+	if errno := rawfile.NonBlockingWrite(e.fds[0].fd, packet.AsSlice()); errno != 0 {
+		return tcpip.TranslateErrno(errno)
+	}
+	return nil
 }
 
 // dispatchLoop reads packets from the file descriptor in a loop and dispatches

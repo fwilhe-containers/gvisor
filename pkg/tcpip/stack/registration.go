@@ -113,9 +113,6 @@ type TransportError interface {
 // TransportEndpoint is the interface that needs to be implemented by transport
 // protocol (e.g., tcp, udp) endpoints that can handle packets.
 type TransportEndpoint interface {
-	// UniqueID returns an unique ID for this transport endpoint.
-	UniqueID() uint64
-
 	// HandlePacket is called by the stack when new packets arrive to this
 	// transport endpoint. It sets the packet buffer's transport header.
 	//
@@ -1089,6 +1086,9 @@ type NetworkLinkEndpoint interface {
 	// physical network doesn't exist, the limit is generally 64k, which
 	// includes the maximum size of an IP packet.
 	MTU() uint32
+
+	// SetMTU update the maximum transmission unit for the endpoint.
+	SetMTU(mtu uint32)
 
 	// MaxHeaderLength returns the maximum size the data link (and
 	// lower level layers combined) headers can have. Higher levels use this
