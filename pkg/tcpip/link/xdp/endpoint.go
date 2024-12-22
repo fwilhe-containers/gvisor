@@ -53,7 +53,7 @@ type endpoint struct {
 	// TODO(b/341946753): Restore when netstack is savable.
 	closed func(tcpip.Error) `state:"nosave"`
 
-	mu sync.RWMutex `state:"nosave"`
+	mu endpointRWMutex `state:"nosave"`
 	// +checkloks:mu
 	networkDispatcher stack.NetworkDispatcher
 
@@ -416,3 +416,6 @@ func (ep *endpoint) dispatch() (bool, tcpip.Error) {
 
 // Close implements stack.LinkEndpoint.
 func (*endpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.
+func (*endpoint) SetOnCloseAction(func()) {}

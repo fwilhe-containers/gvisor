@@ -295,12 +295,9 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	var freed []memmap.FileRange
 
 	d.dataMu.Lock()
-	cseg := d.cache.LowerBoundSegment(mr.Start)
-	for cseg.Ok() && cseg.Start() < mr.End {
-		cseg = d.cache.Isolate(cseg, mr)
+	d.cache.RemoveRangeWith(mr, func(cseg fsutil.FileRangeIterator) {
 		freed = append(freed, memmap.FileRange{cseg.Value(), cseg.Value() + cseg.Range().Length()})
-		cseg = d.cache.Remove(cseg).NextSegment()
-	}
+	})
 	d.dataMu.Unlock()
 
 	// Invalidate mappings of removed pages.
@@ -812,10 +809,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		segMR := seg.Range().Intersect(optional)
 		// TODO(jamieliu): Make Translations writable even if writability is
 		// not required if already kept-dirty by another writable translation.
-		perms := hostarch.AccessType{
-			Read:    true,
-			Execute: true,
-		}
+		perms := hostarch.ReadExecute
 		if at.Write {
 			// From this point forward, this memory can be dirtied through the
 			// mapping at any time.
@@ -961,6 +955,11 @@ func (d *dentryPlatformFile) MapInternal(fr memmap.FileRange, at hostarch.Access
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	return d.hostFileMapper.MapInternal(fr, int(d.mmapFD.RacyLoad()), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (d *dentryPlatformFile) DataFD(fr memmap.FileRange) (int, error) {
+	return d.FD(), nil
 }
 
 // FD implements memmap.File.FD.

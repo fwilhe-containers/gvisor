@@ -60,6 +60,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/hostsettings"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
@@ -75,13 +76,17 @@ const (
 	namespaceAnnotation = "io.kubernetes.cri.sandbox-namespace"
 )
 
+func controlSocketName(id string) string {
+	return fmt.Sprintf("runsc-%s.sock", id)
+}
+
 // createControlSocket finds a location and creates the socket used to
 // communicate with the sandbox. The socket is a UDS on the host filesystem.
 //
 // Note that abstract sockets are *not* used, because any user can connect to
 // them. There is no file mode protecting abstract sockets.
 func createControlSocket(rootDir, id string) (string, int, error) {
-	name := fmt.Sprintf("runsc-%s.sock", id)
+	name := controlSocketName(id)
 
 	// Only use absolute paths to guarantee resolution from anywhere.
 	for _, dir := range []string{rootDir, "/var/run", "/run", "/tmp"} {
@@ -184,6 +189,7 @@ type Sandbox struct {
 
 	// ControlSocketPath is the path to the sandbox's uRPC server socket.
 	// Connections to the sandbox are made through this.
+	// DO NOT access this directly, use getControlSocketPath() instead.
 	ControlSocketPath string `json:"controlSocketPath"`
 
 	// MountHints provides extra information about container mounts that apply
@@ -192,6 +198,12 @@ type Sandbox struct {
 
 	// StartTime is the time the sandbox was started.
 	StartTime time.Time `json:"startTime"`
+
+	// rootDir is the same as config.Config.RootDir. It represents the runtime
+	// root directory being used by the current runsc invocation. It's not saved
+	// to json, because the RootDir can change across runsc invocations.
+	// Depending on the caller's mount namespace, the path can vary.
+	rootDir string `nojson:"true"`
 
 	// child is set if a sandbox process is a child of the current process.
 	//
@@ -390,6 +402,9 @@ func (s *Sandbox) CreateSubcontainer(conf *config.Config, cid string, tty *os.Fi
 
 // StartRoot starts running the root container process inside the sandbox.
 func (s *Sandbox) StartRoot(conf *config.Config) error {
+	if err := hostsettings.Handle(conf); err != nil {
+		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
+	}
 	pid := s.Pid.load()
 	log.Debugf("Start root sandbox %q, PID: %d", s.ID, pid)
 	conn, err := s.sandboxConnect()
@@ -450,7 +465,11 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, direct bool) error {
+func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, direct, background bool) error {
+	if err := hostsettings.Handle(conf); err != nil {
+		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
+	}
+
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	stateFileName := path.Join(imagePath, boot.CheckpointStateFileName)
@@ -464,6 +483,7 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, dir
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{sf},
 		},
+		Background: background,
 	}
 
 	// If the pages file exists, we must pass it in.
@@ -684,9 +704,38 @@ func (s *Sandbox) PortForward(opts *boot.PortForwardOpts) error {
 	return nil
 }
 
+// SetRootDir sets the root directory from the current runsc invocation.
+func (s *Sandbox) SetRootDir(rootDir string) {
+	s.rootDir = rootDir
+}
+
+// getControlSocketPath gets the control socket path for the sandbox.
+func (s *Sandbox) getControlSocketPath() string {
+	err := unix.Access(s.ControlSocketPath, unix.F_OK)
+	if err == nil {
+		return s.ControlSocketPath
+	}
+	log.Infof("Failed to stat Sandbox.ControlSocketPath=%q: %v", s.ControlSocketPath, err)
+
+	// Try to find the control socket in s.RootDir (in case RootDir has changed).
+	if s.rootDir != "" {
+		path := filepath.Join(s.rootDir, controlSocketName(s.ID))
+		if unix.Access(path, unix.F_OK) == nil {
+			log.Infof("Found a control socket in RootDir=%q", s.rootDir)
+			return path
+		}
+	}
+
+	// No control socket found.
+	return ""
+}
+
 func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
 	log.Debugf("Connecting to sandbox %q", s.ID)
-	path := s.ControlSocketPath
+	path := s.getControlSocketPath()
+	if path == "" {
+		return nil, fmt.Errorf("no control socket found for sandbox %q", s.ID)
+	}
 	if len(path) >= linux.UnixPathMax {
 		// This is not an abstract socket path. It is a filesystem path.
 		// UDS connect fails when the len(socket path) >= UNIX_PATH_MAX. Instead
@@ -758,7 +807,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// Open the log files to pass to the sandbox as FDs.
 	if err := donations.OpenAndDonate("log-fd", conf.LogFilename, os.O_CREATE|os.O_WRONLY|os.O_APPEND); err != nil {
-		return err
+		return fmt.Errorf("failed to opening or donating log file %q: %w", conf.LogFilename, err)
 	}
 
 	test := ""
@@ -770,11 +819,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	if specutils.IsDebugCommand(conf, "boot") {
 		if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "boot", test, s.StartTime); err != nil {
-			return err
+			return fmt.Errorf("donating debug log file: %w", err)
 		}
 	}
 	if err := donations.DonateDebugLogFile("panic-log-fd", conf.PanicLog, "panic", test, s.StartTime); err != nil {
-		return err
+		return fmt.Errorf("donating panic log file: %w", err)
 	}
 	covFilename := conf.CoverageReport
 	if covFilename == "" {
@@ -782,7 +831,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	if covFilename != "" && coverage.Available() {
 		if err := donations.DonateDebugLogFile("coverage-fd", covFilename, "cov", test, s.StartTime); err != nil {
-			return err
+			return fmt.Errorf("donating coverage log file: %w", err)
 		}
 	}
 
@@ -812,6 +861,12 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
 		cmd.Env = []string{}
 	}
+	if config.CgoEnabled {
+		// Platforms that use stub processes are not compatible with
+		// the glibc rseq, because they unmap everything from a process
+		// address space.
+		cmd.Env = append(cmd.Env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
+	}
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
@@ -825,19 +880,22 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	profile.UpdatePaths(conf, s.StartTime)
 	if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock, profFlags); err != nil {
-		return err
+		return fmt.Errorf("donating profile block file: %w", err)
 	}
 	if err := donations.OpenAndDonate("profile-cpu-fd", conf.ProfileCPU, profFlags); err != nil {
-		return err
+		return fmt.Errorf("donating profile cpu file: %w", err)
 	}
 	if err := donations.OpenAndDonate("profile-heap-fd", conf.ProfileHeap, profFlags); err != nil {
-		return err
+		return fmt.Errorf("donating profile heap file: %w", err)
 	}
 	if err := donations.OpenAndDonate("profile-mutex-fd", conf.ProfileMutex, profFlags); err != nil {
-		return err
+		return fmt.Errorf("donating profile mutex file: %w", err)
 	}
 	if err := donations.OpenAndDonate("trace-fd", conf.TraceFile, profFlags); err != nil {
-		return err
+		return fmt.Errorf("donating trace file: %w", err)
+	}
+	if err := donations.OpenAndDonate("final-metrics-log-fd", conf.FinalMetricsLog, profFlags); err != nil {
+		return fmt.Errorf("donating final metrics log file: %w", err)
 	}
 
 	// Pass gofer mount configs.
@@ -891,6 +949,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
 	}
 
+	if conf.Network == config.NetworkPlugin {
+		cmd.Env = append(cmd.Env, "GODEBUG=cgocheck=0")
+	}
+
 	// nss is the set of namespaces to join or create before starting the sandbox
 	// process. Mount, IPC and UTS namespaces from the host are not used as they
 	// are virtualized inside the sandbox. Be paranoid and run inside an empty
@@ -901,16 +963,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		{Type: specs.IPCNamespace},
 		{Type: specs.MountNamespace},
 		{Type: specs.UTSNamespace},
-	}
-
-	if gPlatform.Requirements().RequiresCurrentPIDNS {
-		// TODO(b/75837838): Also set a new PID namespace so that we limit
-		// access to other host processes.
-		log.Infof("Sandbox will be started in the current PID namespace")
-	} else {
-		log.Infof("Sandbox will be started in a new PID namespace")
-		nss = append(nss, specs.LinuxNamespace{Type: specs.PIDNamespace})
-		cmd.Args = append(cmd.Args, "--pidns=true")
+		{Type: specs.PIDNamespace},
 	}
 
 	if specutils.NVProxyEnabled(args.Spec, conf) {
@@ -935,7 +988,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// These are set to the uid/gid that the sandbox process will use. May be
-	// overriden below.
+	// overridden below.
 	s.UID = os.Getuid()
 	s.GID = os.Getgid()
 
@@ -1027,7 +1080,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 				// CAP_SETPCAP is required to clear the bounding set.
 				uintptr(capability.CAP_SETPCAP),
 			)
-
+			if gPlatform.Requirements().RequiresCapSysPtrace {
+				cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
+					uintptr(capability.CAP_SYS_PTRACE))
+			}
 		} else {
 			return fmt.Errorf("can't run sandbox process as user nobody since we don't have CAP_SETUID or CAP_SETGID")
 		}
@@ -1273,6 +1329,12 @@ func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 	return ws, nil
 }
 
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed.
+func (s *Sandbox) WaitCheckpoint() error {
+	log.Debugf("Waiting for checkpoint to complete in sandbox %q", s.ID)
+	return s.call(boot.ContMgrWaitCheckpoint, nil, nil)
+}
+
 // IsRootContainer returns true if the specified container ID belongs to the
 // root container.
 func (s *Sandbox) IsRootContainer(cid string) bool {
@@ -1284,9 +1346,10 @@ func (s *Sandbox) IsRootContainer(cid string) bool {
 func (s *Sandbox) destroy() error {
 	log.Debugf("Destroying sandbox %q", s.ID)
 	// Only delete the control file if it exists.
-	if len(s.ControlSocketPath) > 0 {
-		if err := os.Remove(s.ControlSocketPath); err != nil {
-			log.Warningf("failed to delete control socket file %q: %v", s.ControlSocketPath, err)
+	controlSocketPath := s.getControlSocketPath()
+	if len(controlSocketPath) > 0 {
+		if err := os.Remove(controlSocketPath); err != nil {
+			log.Warningf("failed to delete control socket file %q: %v", controlSocketPath, err)
 		}
 	}
 	pid := s.Pid.load()
@@ -1705,7 +1768,7 @@ func checkBinaryPermissions(conf *config.Config) error {
 	}
 
 	if info.Mode().Perm()&neededBits != neededBits {
-		return fmt.Errorf(specutils.FaqErrorMsg("runsc-perms", fmt.Sprintf("%s does not have the correct permissions", exePath)))
+		return fmt.Errorf("%s", specutils.FaqErrorMsg("runsc-perms", fmt.Sprintf("%s does not have the correct permissions", exePath)))
 	}
 	return nil
 }
@@ -1907,6 +1970,10 @@ func setCloExeOnAllFDs() error {
 			}
 			flags, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd), unix.F_GETFD, 0)
 			if errno != 0 {
+				if errno == unix.EBADF {
+					// Raced with the FD being closed.
+					continue
+				}
 				return fmt.Errorf("error getting descriptor flags: %w", errno)
 			}
 			if flags&unix.FD_CLOEXEC != 0 {
@@ -1914,6 +1981,10 @@ func setCloExeOnAllFDs() error {
 			}
 			flags |= unix.FD_CLOEXEC
 			if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd), unix.F_SETFD, flags); errno != 0 {
+				if errno == unix.EBADF {
+					// Raced with the FD being closed.
+					continue
+				}
 				return fmt.Errorf("error setting CLOEXEC: %w", errno)
 			}
 		}

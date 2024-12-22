@@ -50,6 +50,8 @@ const (
 )
 
 // A groBucket holds packets that are undergoing GRO.
+//
+// +stateify savable
 type groBucket struct {
 	// count is the number of packets in the bucket.
 	count int
@@ -265,6 +267,8 @@ func (gb *groBucket) found(gd *GRO, groPkt *groPacket, flushGROPkt bool, pkt *st
 
 // A groPacket is packet undergoing GRO. It may be several packets coalesced
 // together.
+//
+// +stateify savable
 type groPacket struct {
 	// groPacketEntry is an intrusive list.
 	groPacketEntry
@@ -303,6 +307,8 @@ func (pk *groPacket) payloadSize() int {
 }
 
 // GRO coalesces incoming packets to increase throughput.
+//
+// +stateify savable
 type GRO struct {
 	enabled bool
 	buckets [groNBuckets]groBucket
@@ -444,6 +450,7 @@ func (gd *GRO) dispatch6(pkt *stack.PacketBuffer) {
 		case header.IPv6HopByHopOptionsExtHdr:
 		case header.IPv6RoutingExtHdr:
 		case header.IPv6DestinationOptionsExtHdr:
+		case header.IPv6ExperimentExtHdr:
 		default:
 			// This is either a TCP header or something we can't handle.
 			ipHdrSize = int(it.HeaderOffset())

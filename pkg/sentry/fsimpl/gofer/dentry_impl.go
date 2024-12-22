@@ -15,6 +15,8 @@
 package gofer
 
 import (
+	"fmt"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -307,7 +309,7 @@ func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (s
 	case *lisafsDentry:
 		return dt.controlFD.GetXattr(ctx, opts.Name, opts.Size)
 	case *directfsDentry:
-		return dt.getXattr(opts.Name, opts.Size)
+		return dt.getXattr(ctx, opts.Name, opts.Size)
 	default:
 		panic("unknown dentry implementation")
 	}
@@ -511,7 +513,7 @@ func (d *dentry) statfs(ctx context.Context) (linux.Statfs, error) {
 func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	rootInode, rootHostFD, err := fs.initClientAndGetRoot(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize client and get root: %w", err)
 	}
 
 	// The root is always non-synthetic.
@@ -536,14 +538,14 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 		inode, err := controlFD.Walk(ctx, d.name)
 		if err != nil {
 			if !dt.isDir() || !dt.forMountpoint {
-				return err
+				return fmt.Errorf("failed to walk %q of type %x: %w", genericDebugPathname(d.fs, d), dt.fileType(), err)
 			}
 
 			// Recreate directories that were created during volume mounting, since
 			// during restore we don't attempt to remount them.
 			inode, err = controlFD.MkdirAt(ctx, d.name, linux.FileMode(d.mode.Load()), lisafs.UID(d.uid.Load()), lisafs.GID(d.gid.Load()))
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to create mountpoint directory at %q: %w", genericDebugPathname(d.fs, d), err)
 			}
 		}
 		return dt.restoreFile(ctx, &inode, opts)
@@ -556,13 +558,13 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 		})
 		if err != nil {
 			if !dt.isDir() || !dt.forMountpoint {
-				return err
+				return fmt.Errorf("failed to walk %q of type %x: %w", genericDebugPathname(d.fs, d), dt.fileType(), err)
 			}
 
 			// Recreate directories that were created during volume mounting, since
 			// during restore we don't attempt to remount them.
 			if err := unix.Mkdirat(controlFD, d.name, d.mode.Load()); err != nil {
-				return err
+				return fmt.Errorf("failed to create mountpoint directory at %q: %w", genericDebugPathname(d.fs, d), err)
 			}
 
 			// Try again...
@@ -570,7 +572,7 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 				return unix.Openat(controlFD, d.name, flags, 0)
 			})
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to open %q: %w", genericDebugPathname(d.fs, d), err)
 			}
 		}
 		return dt.restoreFile(ctx, childFD, opts)

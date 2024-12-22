@@ -21,10 +21,24 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 )
 
-func frontendIoctlInvoke[Params any](fi *frontendIoctlState, sentryParams *Params) (uintptr, error) {
+func frontendIoctlInvoke[Params any, PtrParams hasStatusPtr[Params]](fi *frontendIoctlState, ioctlParams PtrParams) (uintptr, error) {
+	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fi.fd.hostFD), frontendIoctlCmd(fi.nr, fi.ioctlParamsSize), uintptr(unsafe.Pointer(ioctlParams)))
+	if errno != 0 {
+		return n, errno
+	}
+	if log.IsLogging(log.Debug) {
+		if status := ioctlParams.GetStatus(); status != nvgpu.NV_OK {
+			fi.ctx.Debugf("nvproxy: frontend ioctl failed: status=%#x", status)
+		}
+	}
+	return n, nil
+}
+
+func frontendIoctlBytesInvoke(fi *frontendIoctlState, sentryParams *byte) (uintptr, error) {
 	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fi.fd.hostFD), frontendIoctlCmd(fi.nr, fi.ioctlParamsSize), uintptr(unsafe.Pointer(sentryParams)))
 	if errno != 0 {
 		return n, errno
@@ -70,34 +84,43 @@ func ctrlClientSystemGetBuildVersionInvoke(fi *frontendIoctlState, ioctlParams *
 	return n, nil
 }
 
-func ctrlClientGetSurfaceInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
-	var ctrlParams nvgpu.NV0041_CTRL_GET_SURFACE_INFO_PARAMS
+func ctrlIoctlHasInfoList[Params any, PtrParams hasCtrlInfoListPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParamsValue Params
+	ctrlParams := PtrParams(&ctrlParamsValue)
+
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
 		return 0, linuxerr.EINVAL
 	}
 	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return 0, err
 	}
-	if ctrlParams.SurfaceInfoListSize == 0 {
-		// Compare
-		// src/nvidia/src/kernel/gpu/mem_mgr/mem_ctrl.c:memCtrlCmdGetSurfaceInfoLvm_IMPL().
-		return 0, nil
-	}
-	surfaceInfoList := make([]byte, int(ctrlParams.SurfaceInfoListSize)*(*nvgpu.NVXXXX_CTRL_XXX_INFO)(nil).SizeBytes())
-	if _, err := fi.t.CopyInBytes(addrFromP64(ctrlParams.SurfaceInfoList), surfaceInfoList); err != nil {
-		return 0, err
+	var infoList []byte
+	if listSize := ctrlParams.ListSize(); listSize > 0 {
+		if !rmapiParamsSizeCheck(listSize, nvgpu.CtrlXxxInfoSize) {
+			return 0, ctrlCmdFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+		}
+		infoList = make([]byte, listSize*nvgpu.CtrlXxxInfoSize)
+		if _, err := fi.t.CopyInBytes(addrFromP64(ctrlParams.CtrlInfoList()), infoList); err != nil {
+			return 0, err
+		}
 	}
 
-	origSurfaceInfoList := ctrlParams.SurfaceInfoList
-	ctrlParams.SurfaceInfoList = p64FromPtr(unsafe.Pointer(&surfaceInfoList[0]))
-	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
-	ctrlParams.SurfaceInfoList = origSurfaceInfoList
+	origInfoList := ctrlParams.CtrlInfoList()
+	if infoList == nil {
+		ctrlParams.SetCtrlInfoList(p64FromPtr(unsafe.Pointer(nil)))
+	} else {
+		ctrlParams.SetCtrlInfoList(p64FromPtr(unsafe.Pointer(&infoList[0])))
+	}
+	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	ctrlParams.SetCtrlInfoList(origInfoList)
 	if err != nil {
 		return n, err
 	}
 
-	if _, err := fi.t.CopyOutBytes(addrFromP64(origSurfaceInfoList), surfaceInfoList); err != nil {
-		return 0, err
+	if infoList != nil {
+		if _, err := fi.t.CopyOutBytes(addrFromP64(origInfoList), infoList); err != nil {
+			return n, err
+		}
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
@@ -106,16 +129,33 @@ func ctrlClientGetSurfaceInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54P
 	return n, nil
 }
 
-func ctrlDevGpuGetClasslistInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters, ctrlParams *nvgpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS, classList []uint32) (uintptr, error) {
-	origClassList := ctrlParams.ClassList
-	ctrlParams.ClassList = p64FromPtr(unsafe.Pointer(&classList[0]))
+func ctrlGetNvU32ListInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters, ctrlParams *nvgpu.RmapiParamNvU32List, list []uint32) (uintptr, error) {
+	origList := ctrlParams.List
+	ctrlParams.List = p64FromPtr(unsafe.Pointer(&list[0]))
 	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
-	ctrlParams.ClassList = origClassList
+	ctrlParams.List = origList
 	if err != nil {
 		return n, err
 	}
-	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origClassList), classList); err != nil {
-		return 0, err
+	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(ctrlParams.List), list); err != nil {
+		return n, err
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func ctrlDevGRGetCapsInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters, ctrlParams *nvgpu.NV0080_CTRL_GET_CAPS_PARAMS, capsTbl []byte) (uintptr, error) {
+	origCapsTbl := ctrlParams.CapsTbl
+	ctrlParams.CapsTbl = p64FromPtr(unsafe.Pointer(&capsTbl[0]))
+	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
+	ctrlParams.CapsTbl = origCapsTbl
+	if err != nil {
+		return n, err
+	}
+	if _, err := primitive.CopyByteSliceOut(fi.t, addrFromP64(ctrlParams.CapsTbl), capsTbl); err != nil {
+		return n, err
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
@@ -157,10 +197,10 @@ func ctrlDevFIFOGetChannelList(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54
 	}
 
 	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origPChannelHandleList), channelHandleList); err != nil {
-		return 0, err
+		return n, err
 	}
 	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origPChannelList), channelList); err != nil {
-		return 0, err
+		return n, err
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
@@ -169,40 +209,94 @@ func ctrlDevFIFOGetChannelList(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54
 	return n, nil
 }
 
-func ctrlSubdevGRGetInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
-	var ctrlParams nvgpu.NV2080_CTRL_GR_GET_INFO_PARAMS
+func ctrlClientSystemGetP2PCapsInitializeArray(origArr nvgpu.P64, gpuCount uint32) (nvgpu.P64, []uint32, bool) {
+	// The driver doesn't try and copy memory if the array is null. See
+	// src/nvidia/src/kernel/rmapi/embedded_param_copy.c::embeddedParamCopyIn(),
+	// case NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS.
+	if origArr == 0 {
+		return 0, nil, true
+	}
+
+	// Params size is gpuCount * gpuCount * sizeof(NvU32).
+	numEntries := gpuCount * gpuCount
+	if numEntries*4 > nvgpu.RMAPI_PARAM_COPY_MAX_PARAMS_SIZE {
+		return 0, nil, false
+	}
+
+	arr := make([]uint32, numEntries)
+	return p64FromPtr(unsafe.Pointer(&arr[0])), arr, true
+}
+
+func ctrlClientSystemGetP2PCaps(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
 		return 0, linuxerr.EINVAL
 	}
 	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return 0, err
 	}
-	if ctrlParams.GRInfoListSize == 0 {
-		// Compare
-		// src/nvidia/src/kernel/gpu/gr/kernel_graphics.c:_kgraphicsCtrlCmdGrGetInfoV2().
-		return 0, linuxerr.EINVAL
-	}
-	infoList := make([]byte, int(ctrlParams.GRInfoListSize)*(*nvgpu.NVXXXX_CTRL_XXX_INFO)(nil).SizeBytes())
-	if _, err := fi.t.CopyInBytes(addrFromP64(ctrlParams.GRInfoList), infoList); err != nil {
-		return 0, err
-	}
 
-	origGRInfoList := ctrlParams.GRInfoList
-	ctrlParams.GRInfoList = p64FromPtr(unsafe.Pointer(&infoList[0]))
+	origBusPeerIDs := ctrlParams.BusPeerIDs
+	busPeerIDs, busPeerIDsBuf, ok := ctrlClientSystemGetP2PCapsInitializeArray(origBusPeerIDs, ctrlParams.GpuCount)
+	if !ok {
+		return 0, ctrlCmdFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+	}
+	ctrlParams.BusPeerIDs = busPeerIDs
+
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
-	ctrlParams.GRInfoList = origGRInfoList
+	ctrlParams.BusPeerIDs = origBusPeerIDs
 	if err != nil {
 		return n, err
 	}
 
-	if _, err := fi.t.CopyOutBytes(addrFromP64(origGRInfoList), infoList); err != nil {
-		return n, err
-	}
-	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origBusPeerIDs), busPeerIDsBuf); err != nil {
 		return n, err
 	}
 
-	return n, nil
+	_, err = ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params))
+	return n, err
+}
+
+func ctrlClientSystemGetP2PCapsV550(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS_V550
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	origBusPeerIDs := ctrlParams.BusPeerIDs
+	busPeerIDs, busPeerIDsBuf, ok := ctrlClientSystemGetP2PCapsInitializeArray(origBusPeerIDs, ctrlParams.GpuCount)
+	if !ok {
+		return 0, ctrlCmdFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+	}
+	ctrlParams.BusPeerIDs = busPeerIDs
+
+	origBusEgmPeerIDs := ctrlParams.BusEgmPeerIDs
+	busEgmPeerIDs, busEgmPeerIDsBuf, ok := ctrlClientSystemGetP2PCapsInitializeArray(origBusEgmPeerIDs, ctrlParams.GpuCount)
+	if !ok {
+		return 0, ctrlCmdFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+	}
+	ctrlParams.BusEgmPeerIDs = busEgmPeerIDs
+
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	ctrlParams.BusPeerIDs = origBusPeerIDs
+	ctrlParams.BusEgmPeerIDs = origBusEgmPeerIDs
+	if err != nil {
+		return n, err
+	}
+
+	// If origBufPeerIDS or origBusEgmPeerIDs is null, the corresponding buffer will be nil
+	// and CopyUint32SliceOut() will be a no-op.
+	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origBusPeerIDs), busPeerIDsBuf); err != nil {
+		return n, err
+	}
+	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(origBusEgmPeerIDs), busEgmPeerIDsBuf); err != nil {
+		return n, err
+	}
+	_, err = ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params))
+	return n, err
 }
 
 func rmAllocInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, allocParams *Params, isNVOS64 bool, addObjLocked func(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params)) (uintptr, error) {
@@ -225,16 +319,19 @@ func rmAllocInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64
 	// identically to the equivalent NVOS21Parameters; compare
 	// src/nvidia/src/kernel/rmapi/entry_points.c:_nv04AllocWithSecInfo() and
 	// _nv04AllocWithAccessSecInfo().
+	origParamsSize := fi.ioctlParamsSize
+	fi.ioctlParamsSize = nvgpu.SizeofNVOS64Parameters
 	fi.fd.dev.nvp.objsLock()
-	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fi.fd.hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64Parameters), uintptr(unsafe.Pointer(ioctlParams)))
-	if errno == 0 && ioctlParams.Status == nvgpu.NV_OK {
+	n, err := frontendIoctlInvoke(fi, ioctlParams)
+	fi.ioctlParamsSize = origParamsSize
+	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
 		addObjLocked(fi, ioctlParams, rightsRequested, allocParams)
 	}
 	fi.fd.dev.nvp.objsUnlock()
 	ioctlParams.PAllocParms = origPAllocParms
 	ioctlParams.PRightsRequested = origPRightsRequested
-	if errno != 0 {
-		return n, errno
+	if err != nil {
+		return n, err
 	}
 
 	// Copy updated params out to the application.
@@ -246,6 +343,26 @@ func rmAllocInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64
 		}
 	}
 	if _, err := outIoctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func rmIdleChannelsInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS30Parameters, clientsBuf, devicesBuf, channelsBuf *byte) (uintptr, error) {
+	origClients := ioctlParams.Clients
+	origDevices := ioctlParams.Devices
+	origChannels := ioctlParams.Channels
+	ioctlParams.Clients = p64FromPtr(unsafe.Pointer(clientsBuf))
+	ioctlParams.Devices = p64FromPtr(unsafe.Pointer(devicesBuf))
+	ioctlParams.Channels = p64FromPtr(unsafe.Pointer(channelsBuf))
+	n, err := frontendIoctlInvoke(fi, ioctlParams)
+	ioctlParams.Clients = origClients
+	ioctlParams.Devices = origDevices
+	ioctlParams.Channels = origChannels
+	if err != nil {
+		return n, err
+	}
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
 		return n, err
 	}
 	return n, nil
@@ -265,8 +382,19 @@ func rmVidHeapControlAllocSize(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS32
 	fi.fd.dev.nvp.objsLock()
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
 	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
-		// src/nvidia/src/kernel/mem_mgr/virtual_mem.c:virtmemConstruct_IMPL() => refAddDependant()
-		fi.fd.dev.nvp.objAdd(fi.ctx, ioctlParams.HRoot, allocSizeParams.HMemory, nvgpu.NV50_MEMORY_VIRTUAL, &virtMem{}, ioctlParams.HObjectParent, ioctlParams.HVASpace)
+		// src/nvidia/interface/deprecated/rmapi_deprecated_vidheapctrl.c:_rmVidHeapControlAllocCommon()
+		if allocSizeParams.Flags&nvgpu.NVOS32_ALLOC_FLAGS_VIRTUAL != 0 {
+			// src/nvidia/src/kernel/mem_mgr/virtual_mem.c:virtmemConstruct_IMPL() => refAddDependant()
+			fi.fd.dev.nvp.objAdd(fi.ctx, ioctlParams.HRoot, allocSizeParams.HMemory, nvgpu.NV50_MEMORY_VIRTUAL, &miscObject{}, ioctlParams.HObjectParent, ioctlParams.HVASpace)
+		} else {
+			classID := nvgpu.ClassID(nvgpu.NV01_MEMORY_SYSTEM)
+			if (allocSizeParams.Attr2>>nvgpu.NVOS32_ATTR2_USE_EGM_SHIFT)&nvgpu.NVOS32_ATTR2_USE_EGM_MASK == nvgpu.NVOS32_ATTR2_USE_EGM_TRUE {
+				classID = nvgpu.NV_MEMORY_EXTENDED_USER
+			} else if (allocSizeParams.Attr>>nvgpu.NVOS32_ATTR_LOCATION_SHIFT)&nvgpu.NVOS32_ATTR_LOCATION_MASK == nvgpu.NVOS32_ATTR_LOCATION_VIDMEM {
+				classID = nvgpu.NV01_MEMORY_LOCAL_USER
+			}
+			fi.fd.dev.nvp.objAdd(fi.ctx, ioctlParams.HRoot, allocSizeParams.HMemory, classID, &miscObject{}, ioctlParams.HObjectParent)
+		}
 	}
 	fi.fd.dev.nvp.objsUnlock()
 	allocSizeParams.Address = origAddress

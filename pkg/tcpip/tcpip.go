@@ -35,7 +35,6 @@ import (
 	"io"
 	"math"
 	"math/bits"
-	"math/rand"
 	"net"
 	"reflect"
 	"strconv"
@@ -43,6 +42,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -53,6 +53,17 @@ const (
 	ipv4ProtocolNumber = 0x0800
 	ipv6AddressSize    = 16
 	ipv6ProtocolNumber = 0x86dd
+)
+
+const (
+	// LinkAddressSize is the size of a MAC address.
+	LinkAddressSize = 6
+)
+
+// Known IP address.
+var (
+	IPv4Zero = []byte{0, 0, 0, 0}
+	IPv6Zero = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 )
 
 // Errors related to Subnet
@@ -1548,7 +1559,7 @@ func (r Route) String() string {
 // Equal returns true if the given Route is equal to this Route.
 func (r Route) Equal(to Route) bool {
 	// NOTE: This relies on the fact that r.Destination == to.Destination
-	return r.Destination.Equal(to.Destination) && r.Gateway == to.Gateway && r.NIC == to.NIC
+	return r.Destination.Equal(to.Destination) && r.NIC == to.NIC
 }
 
 // TransportProtocolNumber is the number of a transport protocol.
@@ -1969,6 +1980,10 @@ type IPForwardingStats struct {
 	// Errors is the number of IP packets received which could not be
 	// successfully forwarded.
 	Errors *StatCounter
+
+	// OutgoingDeviceClosedForSend is the number of packets that were dropped due
+	// to the outgoing device being closed for send.
+	OutgoingDeviceClosedForSend *StatCounter
 
 	// LINT.ThenChange(network/internal/ip/stats.go:MultiCounterIPForwardingStats)
 }
@@ -2705,7 +2720,7 @@ func ParseMACAddress(s string) (LinkAddress, error) {
 	parts := strings.FieldsFunc(s, func(c rune) bool {
 		return c == ':' || c == '-'
 	})
-	if len(parts) != 6 {
+	if len(parts) != LinkAddressSize {
 		return "", fmt.Errorf("inconsistent parts: %s", s)
 	}
 	addr := make([]byte, 0, len(parts))
@@ -2721,7 +2736,7 @@ func ParseMACAddress(s string) (LinkAddress, error) {
 
 // GetRandMacAddr returns a mac address that can be used for local virtual devices.
 func GetRandMacAddr() LinkAddress {
-	mac := make(net.HardwareAddr, 6)
+	mac := make(net.HardwareAddr, LinkAddressSize)
 	rand.Read(mac) // Fill with random data.
 	mac[0] &^= 0x1 // Clear multicast bit.
 	mac[0] |= 0x2  // Set local assignment bit (IEEE802).

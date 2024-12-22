@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -178,6 +177,7 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 	return err
 }
 
+// Pause will pause a running container.
 func (r *Runsc) Pause(context context.Context, id string) error {
 	if out, _, err := cmdOutput(r.command(context, "pause", id), true); err != nil {
 		return fmt.Errorf("unable to pause: %w: %s", err, out)
@@ -185,6 +185,7 @@ func (r *Runsc) Pause(context context.Context, id string) error {
 	return nil
 }
 
+// Resume will resume a paused container.
 func (r *Runsc) Resume(context context.Context, id string) error {
 	if out, _, err := cmdOutput(r.command(context, "resume", id), true); err != nil {
 		return fmt.Errorf("unable to resume: %w: %s", err, out)
@@ -194,7 +195,10 @@ func (r *Runsc) Resume(context context.Context, id string) error {
 
 // Start will start an already created container.
 func (r *Runsc) Start(context context.Context, id string, cio runc.IO) error {
-	cmd := r.command(context, "start", id)
+	return r.start(context, cio, r.command(context, "start", id))
+}
+
+func (r *Runsc) start(context context.Context, cio runc.IO, cmd *exec.Cmd) error {
 	if cio != nil {
 		cio.Set(cmd)
 	}
@@ -224,6 +228,40 @@ func (r *Runsc) Start(context context.Context, id string, cio runc.IO) error {
 	}
 
 	return err
+}
+
+// RestoreOpts is a set of options to runsc.Restore().
+type RestoreOpts struct {
+	ImagePath  string
+	Detach     bool
+	Direct     bool
+	Background bool
+}
+
+func (o *RestoreOpts) args() []string {
+	var out []string
+	if o.ImagePath != "" {
+		out = append(out, fmt.Sprintf("--image-path=%s", o.ImagePath))
+	}
+	if o.Detach {
+		out = append(out, "--detach")
+	}
+	if o.Direct {
+		out = append(out, "--direct")
+	}
+	if o.Background {
+		out = append(out, "--background")
+	}
+	return out
+}
+
+// Restore will restore an already created container.
+func (r *Runsc) Restore(context context.Context, id string, cio runc.IO, opts *RestoreOpts) error {
+	args := []string{"restore"}
+	if opts != nil {
+		args = append(args, opts.args()...)
+	}
+	return r.start(context, cio, r.command(context, append(args, id)...))
 }
 
 type waitResult struct {
@@ -280,7 +318,7 @@ func (o *ExecOpts) args() (out []string, err error) {
 // Exec executes an additional process inside the container based on a full OCI
 // Process specification.
 func (r *Runsc) Exec(context context.Context, id string, spec specs.Process, opts *ExecOpts) error {
-	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), "runsc-process")
+	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "runsc-process")
 	if err != nil {
 		return err
 	}

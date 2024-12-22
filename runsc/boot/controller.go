@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -92,6 +93,13 @@ const (
 	// return its ExitStatus.
 	ContMgrWaitPID = "containerManager.WaitPID"
 
+	// ContMgrWaitCheckpoint waits for the Kernel to have been successfully
+	// checkpointed n-1 times, then waits for either the n-th successful
+	// checkpoint (in which case it returns nil) or any number of failed
+	// checkpoints (in which case it returns an error returned by any such
+	// failure).
+	ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
+
 	// ContMgrRootContainerStart starts a new sandbox with a root container.
 	ContMgrRootContainerStart = "containerManager.StartRoot"
 
@@ -117,6 +125,9 @@ const (
 const (
 	// NetworkCreateLinksAndRoutes creates links and routes in a network stack.
 	NetworkCreateLinksAndRoutes = "Network.CreateLinksAndRoutes"
+
+	// NetworkInitPluginStack initializes third-party network stack.
+	NetworkInitPluginStack = "Network.InitPluginStack"
 
 	// DebugStacks collects sandbox stacks for debugging.
 	DebugStacks = "debug.Stacks"
@@ -202,6 +213,11 @@ func (c *controller) registerHandlers() {
 			Kernel: l.k,
 		})
 	}
+
+	if pluginStack, ok := l.k.RootNetworkNamespace().Stack().(plugin.PluginStack); ok {
+		c.srv.Register(&Network{PluginStack: pluginStack})
+	}
+
 	if l.root.conf.ProfileEnable {
 		c.srv.Register(control.NewProfile(l.k))
 	}
@@ -472,6 +488,7 @@ type RestoreOpts struct {
 	urpc.FilePayload
 	HavePagesFile  bool
 	HaveDeviceFile bool
+	Background     bool
 }
 
 // Restore loads a container from a statefile.
@@ -480,6 +497,10 @@ type RestoreOpts struct {
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Restore")
+
+	cm.l.mu.Lock()
+	cu := cleanup.Make(cm.l.mu.Unlock)
+	defer cu.Clean()
 
 	if cm.l.state == restoring {
 		return fmt.Errorf("restore is already in progress")
@@ -504,9 +525,15 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 		return fmt.Errorf("statefile cannot be empty")
 	}
 
-	cm.restorer = &restorer{restoreDone: cm.onRestoreDone, stateFile: stateFile}
+	cm.restorer = &restorer{
+		restoreDone: cm.onRestoreDone,
+		stateFile:   stateFile,
+		background:  o.Background,
+	}
 	cm.l.restoreWaiters = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoring
+	// Release `cm.l.mu`.
+	cu.Clean()
 
 	fileIdx := 1
 	if o.HavePagesFile {
@@ -583,9 +610,12 @@ func (cm *containerManager) onRestoreDone() error {
 func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) error {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 
+	cm.l.mu.Lock()
 	if cm.l.state != restoring {
+		cm.l.mu.Unlock()
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer")
 	}
+	cm.l.mu.Unlock()
 
 	// Validate arguments.
 	if args.Spec == nil {
@@ -664,7 +694,7 @@ func (cm *containerManager) Pause(_, _ *struct{}) error {
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
 	cm.l.k.Unpause()
-	return postResumeImpl(cm.l.k)
+	return postResumeImpl(cm.l)
 }
 
 // Wait waits for the init process in the given container.
@@ -689,6 +719,14 @@ func (cm *containerManager) WaitPID(args *WaitPIDArgs, waitStatus *uint32) error
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d", args.CID, args.PID)
 	err := cm.l.waitPID(kernel.ThreadID(args.PID), args.CID, waitStatus)
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d, waitStatus: %#x, err: %v", args.CID, args.PID, *waitStatus, err)
+	return err
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed.
+func (cm *containerManager) WaitCheckpoint(*struct{}, *struct{}) error {
+	log.Debugf("containerManager.WaitCheckpoint")
+	err := cm.l.k.WaitForCheckpoint()
+	log.Debugf("containerManager.WaitCheckpoint done, err = %v", err)
 	return err
 }
 
@@ -791,8 +829,9 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 	log.Debugf("containerManager.ProcfsDump")
 	ts := cm.l.k.TaskSet()
 	pidns := ts.Root
-	*out = make([]procfs.ProcessProcfsDump, 0, len(cm.l.processes))
-	for _, tg := range pidns.ThreadGroups() {
+	tgs := pidns.ThreadGroups()
+	*out = make([]procfs.ProcessProcfsDump, 0, len(tgs))
+	for _, tg := range tgs {
 		pid := pidns.IDOfThreadGroup(tg)
 		procDump, err := procfs.Dump(tg.Leader(), pid, pidns)
 		if err != nil {
@@ -831,6 +870,8 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 	var cu cleanup.Cleanup
 	defer cu.Clean()
 
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
 	eid := execID{cid: args.ContainerID}
 	ep, ok := cm.l.processes[eid]
 	if !ok {

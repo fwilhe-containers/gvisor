@@ -32,7 +32,7 @@ const (
 // +marshal
 // +stateify savable
 type Handle struct {
-	Val uint32
+	Val uint32 `nvproxy:"NvHandle"`
 }
 
 // String implements fmt.Stringer.String.
@@ -84,3 +84,8 @@ type RS_SHARE_POLICY struct {
 //
 // +marshal
 type NvUUID [16]uint8
+
+// HasStatus is an interface for parameter structs that have a Status field.
+type HasStatus interface {
+	GetStatus() uint32
+}

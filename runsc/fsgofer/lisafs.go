@@ -288,12 +288,17 @@ func (fd *controlFDLisa) Stat() (linux.Statx, error) {
 // SetStat implements lisafs.ControlFDImpl.SetStat.
 func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, failureErr error) {
 	if stat.Mask&unix.STATX_MODE != 0 {
-		if fd.IsSocket() {
-			// fchmod(2) on socket files created via bind(2) fails. We need to
-			// fchmodat(2) it from its parent.
+		switch fd.FileType() {
+		case unix.S_IFLNK:
+			// Linux does not support changing the mode of symlinks. See
+			// fs/attr.c:notify_change().
+			failureMask |= unix.STATX_MODE
+			failureErr = unix.EOPNOTSUPP
+		case unix.S_IFSOCK:
+			// Sockets use O_PATH host FDs. However, fchmod(2) fails with EBADF for
+			// O_PATH FDs. Try to fchmodat(2) it from its parent.
 			parent, sockName, err := fd.getParentFD()
 			if err == nil {
-				// Note that AT_SYMLINK_NOFOLLOW flag is not currently supported.
 				err = unix.Fchmodat(parent, sockName, stat.Mode&^unix.S_IFMT, 0 /* flags */)
 				unix.Close(parent)
 			}
@@ -302,7 +307,7 @@ func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, fa
 				failureMask |= unix.STATX_MODE
 				failureErr = err
 			}
-		} else {
+		default:
 			if err := unix.Fchmod(fd.hostFD, stat.Mode&^unix.S_IFMT); err != nil {
 				log.Warningf("SetStat fchmod failed %q, err: %v", fd.Node().FilePath(), err)
 				failureMask |= unix.STATX_MODE
@@ -923,6 +928,12 @@ func (fd *controlFDLisa) Renamed() {
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
 	data := getValueBuf(size)
+	if fd.IsSocket() || fd.IsSymlink() {
+		// Sockets and symlinks use O_PATH host FDs. However, fgetxattr(2) fails
+		// with EBADF for O_PATH FDs. Use lgetxattr(2) instead.
+		xattrSize, err := unix.Lgetxattr(fd.Node().FilePath(), name, data)
+		return uint16(xattrSize), err
+	}
 	xattrSize, err := unix.Fgetxattr(fd.hostFD, name, data)
 	return uint16(xattrSize), err
 }

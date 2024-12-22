@@ -30,13 +30,13 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/pkg/process"
 	"github.com/containerd/containerd/pkg/stdio"
 
 	"github.com/containerd/fifo"
 	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/shim/extension"
 	"gvisor.dev/gvisor/pkg/shim/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/utils"
 )
@@ -155,7 +155,7 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to retrieve console master: %w", err)
 		}
-		console, err = p.Platform.CopyConsole(ctx, console, r.Stdin, r.Stdout, r.Stderr, &p.wg)
+		console, err = p.Platform.CopyConsole(ctx, console, r.ID, r.Stdin, r.Stdout, r.Stderr, &p.wg)
 		if err != nil {
 			return fmt.Errorf("failed to start console copy: %w", err)
 		}
@@ -226,16 +226,27 @@ func (p *Init) Start(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return p.initState.Start(ctx)
+	return p.initState.Start(ctx, nil /* restoreConf */)
 }
 
-func (p *Init) start(ctx context.Context) error {
+func (p *Init) start(ctx context.Context, restoreConf *extension.RestoreConfig) error {
 	var cio runc.IO
 	if !p.Sandbox {
 		cio = p.io
 	}
-	if err := p.runtime.Start(ctx, p.id, cio); err != nil {
-		return p.runtimeError(err, "OCI runtime start failed")
+	if restoreConf == nil {
+		if err := p.runtime.Start(ctx, p.id, cio); err != nil {
+			return p.runtimeError(err, "OCI runtime start failed")
+		}
+	} else {
+		if err := p.runtime.Restore(ctx, p.id, cio, &runsccmd.RestoreOpts{
+			ImagePath:  restoreConf.ImagePath,
+			Detach:     true,
+			Direct:     restoreConf.Direct,
+			Background: restoreConf.Background,
+		}); err != nil {
+			return p.runtimeError(err, "OCI runtime restore failed")
+		}
 	}
 	go func() {
 		status, err := p.runtime.Wait(context.Background(), p.id)
@@ -253,7 +264,15 @@ func (p *Init) start(ctx context.Context) error {
 	return nil
 }
 
-// SetExited set the exit stauts of the init process.
+// Restore restores the container from a snapshot.
+func (p *Init) Restore(ctx context.Context, conf *extension.RestoreConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Start(ctx, conf)
+}
+
+// SetExited set the exit status of the init process.
 func (p *Init) SetExited(status int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -392,7 +411,7 @@ func (p *Init) Runtime() *runsccmd.Runsc {
 }
 
 // Exec returns a new child process.
-func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (process.Process, error) {
+func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (extension.Process, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -400,7 +419,7 @@ func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (process.Pr
 }
 
 // exec returns a new exec'd process.
-func (p *Init) exec(path string, r *ExecConfig) (process.Process, error) {
+func (p *Init) exec(path string, r *ExecConfig) (extension.Process, error) {
 	var spec specs.Process
 	if err := json.Unmarshal(r.Spec.Value, &spec); err != nil {
 		return nil, err

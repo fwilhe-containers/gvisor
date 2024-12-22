@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+// +stateify savable
 type serverEndpoint struct {
 	// bufferSize is the size of each individual buffer.
 	// bufferSize is immutable.
@@ -39,7 +40,7 @@ type serverEndpoint struct {
 	stopRequested atomicbitops.Uint32
 
 	// Wait group used to indicate that all workers have stopped.
-	completed sync.WaitGroup
+	completed sync.WaitGroup `state:"nosave"`
 
 	// peerFD is an fd to the peer that can be used to detect when the peer is
 	// gone.
@@ -59,10 +60,10 @@ type serverEndpoint struct {
 
 	// onClosed is a function to be called when the FD's peer (if any) closes its
 	// end of the communication pipe.
-	onClosed func(tcpip.Error)
+	onClosed func(tcpip.Error) `state:"nosave"`
 
 	// mu protects the following fields.
-	mu sync.RWMutex
+	mu serverEndpointRWMutex `state:"nosave"`
 
 	// tx is the transmit queue.
 	// +checklocks:mu
@@ -117,6 +118,9 @@ func NewServerEndpoint(opts Options) (stack.LinkEndpoint, error) {
 
 	return e, nil
 }
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*serverEndpoint) SetOnCloseAction(func()) {}
 
 // Close frees all resources associated with the endpoint.
 func (e *serverEndpoint) Close() {

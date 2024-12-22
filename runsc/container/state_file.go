@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -101,6 +100,7 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		}
 		return nil, fmt.Errorf("reading container metadata file %q: %v", state.statePath(), err)
 	}
+	c.Sandbox.SetRootDir(rootDir)
 
 	if opts.RootContainer && c.ID != c.Sandbox.ID {
 		return nil, fmt.Errorf("ID %q doesn't belong to a sandbox", id)
@@ -365,7 +365,7 @@ func (s *StateFile) SaveLocked(v any) error {
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(s.statePath(), meta, 0640); err != nil {
+	if err := os.WriteFile(s.statePath(), meta, 0640); err != nil {
 		return fmt.Errorf("writing json file: %v", err)
 	}
 	return nil
@@ -383,7 +383,7 @@ func (s *StateFile) load(v any, opts LoadOpts) error {
 	}
 	defer s.UnlockOrDie()
 
-	metaBytes, err := ioutil.ReadFile(s.statePath())
+	metaBytes, err := os.ReadFile(s.statePath())
 	if err != nil {
 		return err
 	}

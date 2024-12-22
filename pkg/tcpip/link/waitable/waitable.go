@@ -37,7 +37,7 @@ var _ stack.LinkEndpoint = (*Endpoint)(nil)
 type Endpoint struct {
 	dispatchGate sync.Gate
 
-	mu sync.RWMutex `state:"nosave"`
+	mu endpointRWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 
@@ -181,6 +181,11 @@ func (e *Endpoint) AddHeader(pkt *stack.PacketBuffer) {
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
 func (e *Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	return e.lower.ParseHeader(pkt)
+}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (e *Endpoint) SetOnCloseAction(action func()) {
+	e.lower.SetOnCloseAction(action)
 }
 
 // Close implements stack.LinkEndpoint.

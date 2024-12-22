@@ -188,7 +188,7 @@ type endpoint struct {
 	onClosed func(tcpip.Error) `state:"nosave"`
 
 	// mu protects the following fields.
-	mu sync.RWMutex `state:"nosave"`
+	mu endpointRWMutex `state:"nosave"`
 
 	// tx is the transmit queue.
 	// +checklocks:mu
@@ -253,12 +253,18 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (e *endpoint) SetOnCloseAction(func()) {}
+
 // Close frees most resources associated with the endpoint. Wait() must be
 // called after Close() in order to free the rest.
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
-	e.stopRequested.Store(1)
+	if e.stopRequested.Swap(1) == 1 {
+		// It is already closed.
+		return
+	}
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also

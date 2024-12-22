@@ -32,7 +32,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
@@ -101,6 +100,7 @@ type inode struct {
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
@@ -669,14 +669,7 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 
 	case unix.S_IFREG, unix.S_IFIFO, unix.S_IFCHR:
 		if i.isTTY {
-			fd := &TTYFileDescription{
-				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultReplicaTermios,
-			}
-			if task := kernel.TaskFromContext(ctx); task != nil {
-				fd.fgProcessGroup = task.ThreadGroup().ProcessGroup()
-				fd.session = fd.fgProcessGroup.Session()
-			}
+			fd := NewTTYFileDescription(i)
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
 			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {

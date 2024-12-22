@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -97,12 +98,15 @@ func (t *syscallThread) init(seccompNotify bool) error {
 		return err
 	}
 
-	if seccompNotify {
-		t.seccompNotify = t.installSeccompNotify()
+	if seccompNotify && seccompNotifyIsSupported {
+		if t.seccompNotify, err = t.installSeccompNotify(); err != nil {
+			t.destroy()
+			return fmt.Errorf("failed to install seccomp notify rules: %w", err)
+		}
 	}
 
 	// Map the stack into the sentry.
-	sentryAddr, _, errno := unix.RawSyscall6(
+	sentryAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		syscallThreadMessageSize,
@@ -121,11 +125,11 @@ func (t *syscallThread) init(seccompNotify bool) error {
 
 func (t *syscallThread) destroy() {
 	if t.sentryAddr != 0 {
-		_, _, errno := unix.RawSyscall6(
+		errno := hostsyscall.RawSyscallErrno(
 			unix.SYS_MUNMAP,
 			t.sentryAddr,
 			syscallThreadMessageSize,
-			0, 0, 0, 0)
+			0)
 		if errno != 0 {
 			panic(fmt.Sprintf("mumap failed: %v", errno))
 		}
@@ -142,19 +146,19 @@ func (t *syscallThread) destroy() {
 	t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
 }
 
-func (t *syscallThread) installSeccompNotify() *os.File {
+func (t *syscallThread) installSeccompNotify() (*os.File, error) {
 	fd, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, seccomp.SYS_SECCOMP,
 		arch.SyscallArgument{Value: uintptr(linux.SECCOMP_SET_MODE_FILTER)},
 		arch.SyscallArgument{Value: uintptr(linux.SECCOMP_FILTER_FLAG_NEW_LISTENER)},
 		arch.SyscallArgument{Value: stubSyscallRules})
 	if err != nil {
-		panic(fmt.Sprintf("seccomp failed: %v", err))
+		return nil, err
 	}
-	_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, fd, linux.SECCOMP_IOCTL_NOTIF_SET_FLAGS, linux.SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
+	errno := hostsyscall.RawSyscallErrno(unix.SYS_IOCTL, fd, linux.SECCOMP_IOCTL_NOTIF_SET_FLAGS, linux.SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
 	if errno != 0 {
 		t.thread.Debugf("failed to set SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP")
 	}
-	return os.NewFile(fd, "seccomp_notify")
+	return os.NewFile(fd, "seccomp_notify"), nil
 }
 
 // mapMessageIntoStub maps the syscall message into the stub process address space.

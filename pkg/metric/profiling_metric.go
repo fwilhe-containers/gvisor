@@ -16,6 +16,7 @@ package metric
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -30,13 +31,13 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/prometheus"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 const (
 	// snapshotBufferSize is the number of snapshots within one item of the
 	// ringbuffer. Increasing this number means less context-switching
-	// overhead between collector and writer goroutines, but worse time
-	// precision, as the precise time is refreshed every this many snapshots.
+	// overhead between collector and writer goroutines, but more memory usage.
 	snapshotBufferSize = 1024
 	// snapshotRingbufferSize is the number of items in the ringbuffer.
 	// Increasing this number means the writer has more slack to catch up
@@ -57,7 +58,57 @@ const (
 	// MetricsStartTimeIndicator is prepended before the start time of the
 	// metrics collection.
 	MetricsStartTimeIndicator = "START_TIME\t"
+	// MetricsStatsIndicator is prepended before the stats of the metrics
+	// collection process.
+	MetricsStatsIndicator = "STATS\t"
 )
+
+// CollectionStats contains statistics about the profiling metrics collection
+// process itself.
+type CollectionStats struct {
+	// mu protects the fields below.
+	mu sync.Mutex `json:"-"`
+
+	// CollectionRate is the rate at which the metrics are meant to be
+	// collected.
+	CollectionRateNanos uint64 `json:"collection_rate_nanos"`
+
+	// CheapStartNanos is the time at which the collector started in nanoseconds,
+	// as returned by CheapNowNano.
+	CheapStartNanos uint64 `json:"cheap_start_nanos"`
+
+	// CheapLastCollectionNanos is the time at which the last collection was
+	// meant to be performed, in nanoseconds as returned by CheapNowNano.
+	CheapLastCollectionNanos uint64 `json:"cheap_last_collection_nanos"`
+
+	// TotalSnapshots is the total number of snapshots successfully taken.
+	TotalSnapshots uint64 `json:"total_snapshots"`
+
+	// TotalSleepTimingError is the running sum of absolute difference in timing
+	// between when the collector was meant to start collecting a metric snapshot
+	// vs when it actually collected it. It should be divided by TotalSnapshots
+	// to get the average sleep timing error.
+	TotalSleepTimingErrorNanos uint64 `json:"total_sleep_timing_error_nanos"`
+
+	// TotalCollectionTimingError is the running sum of time spent doing actual
+	// metric collection, i.e. retrieving numerical values from metrics.
+	// The larger this duration is, the more time gap there is between the first
+	// metric being collected and the last within a single metric collection
+	// cycle. This can cause the metric data to be less accurate because all of
+	// these points will be recorded as having the same timestamp despite this
+	// not actually being the case.
+	// It should be divided by TotalSnapshots to get the average
+	// per-collection-cycle collection timing error.
+	TotalCollectionTimingErrorNanos uint64 `json:"total_collection_timing_error_nanos"`
+
+	// NumBackoffSleeps is the number of times the collector had to back off
+	// because the writer was too slow.
+	NumBackoffSleeps uint64 `json:"num_backoff_sleeps"`
+
+	// TotalBackoffSleep is the running sum of time the collector had to back
+	// off because the writer was too slow.
+	TotalBackoffSleepNanos uint64 `json:"total_backoff_sleep_nanos"`
+}
 
 var (
 	// profilingMetricsStarted indicates whether StartProfilingMetrics has
@@ -67,8 +118,9 @@ var (
 	// goroutine to stop recording and writing metrics.
 	stopProfilingMetrics atomicbitops.Bool
 	// doneProfilingMetrics is used to signal that the profiling metrics
-	// goroutines are finished.
-	doneProfilingMetrics chan bool
+	// goroutines are finished. It carries information about the stats of
+	// the profiling metrics collection process.
+	doneProfilingMetrics chan *CollectionStats
 	// definedProfilingMetrics is the set of metrics known to be created for
 	// profiling (see condmetric_profiling.go).
 	definedProfilingMetrics []string
@@ -77,7 +129,7 @@ var (
 // snapshots is used to as temporary storage of metric data
 // before it's written to the writer.
 type snapshots struct {
-	numMetrics int
+	numEntries int
 	// startTime is the time at which collection started in nanoseconds.
 	startTime int64
 	// ringbuffer is used to store metric data.
@@ -96,8 +148,14 @@ type writeReq struct {
 
 // ProfilingMetricsWriter is the interface for profiling metrics sinks.
 type ProfilingMetricsWriter interface {
+	// Write from the io.Writer interface.
+	io.Writer
+
 	// WriteString from the io.StringWriter interface.
 	io.StringWriter
+
+	// Truncate truncates the underlying writer, if possible.
+	Truncate(size int64) error
 
 	// Close closes the writer.
 	Close() error
@@ -121,6 +179,11 @@ type ProfilingMetricsOptions[T ProfilingMetricsWriter] struct {
 	Rate time.Duration
 }
 
+// valueFunc returns the value of a single metric with a single field value
+// combination. For distributions, it returns a single statistic of that
+// distribution.
+type valueFunc func() uint64
+
 // StartProfilingMetrics checks the ProfilingMetrics runsc flags and creates
 // goroutines responsible for outputting the profiling metric data.
 //
@@ -134,25 +197,18 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 		return errors.New("metric initialization is not complete")
 	}
 
-	var values []func(fieldValues ...*FieldValue) uint64
+	var valueFuncs []valueFunc
 	var headers []string
 	var columnHeaders strings.Builder
 	columnHeaders.WriteString(TimeColumn)
-	numMetrics := 0
+	numEntries := 0
 
 	if len(opts.Metrics) > 0 {
-		metrics := strings.Split(opts.Metrics, ",")
-		numMetrics = len(metrics)
-
-		for _, name := range metrics {
+		for _, name := range strings.Split(opts.Metrics, ",") {
 			name := strings.TrimSpace(name)
 			m, ok := allMetrics.uint64Metrics[name]
 			if !ok {
 				return fmt.Errorf("given profiling metric name '%s' does not correspond to a registered Uint64 metric", name)
-			}
-			if len(m.fields) > 0 {
-				// TODO(b/240280155): Add support for field values.
-				return fmt.Errorf("will not profile metric '%s' because it has metric fields which are not supported", name)
 			}
 			var metricMetadataHeader strings.Builder
 			metricMetadataHeader.WriteString(MetricsMetaIndicator)
@@ -164,9 +220,31 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 			}
 			metricMetadataHeader.Write(metricMetadata)
 			headers = append(headers, metricMetadataHeader.String())
-			columnHeaders.WriteRune('\t')
-			columnHeaders.WriteString(name)
-			values = append(values, m.value)
+			fieldMapper, err := newFieldMapper(m.fields...)
+			if err != nil {
+				return fmt.Errorf("failed to create field mapper for metric %q: %w", name, err)
+			}
+			metricValueFunc := m.value
+			for fieldKey := 0; fieldKey < fieldMapper.numKeys(); fieldKey++ {
+				fieldValues := make([]*FieldValue, len(m.fields))
+				fieldMapper.keyToMultiFieldInPlace(fieldKey, fieldValues)
+				columnHeaders.WriteRune('\t')
+				columnHeaders.WriteString(name)
+				if len(fieldValues) > 0 {
+					columnHeaders.WriteRune('[')
+					for i, fieldValue := range fieldValues {
+						if i > 0 {
+							columnHeaders.WriteRune(',')
+						}
+						columnHeaders.WriteString(fieldValue.Value)
+					}
+					columnHeaders.WriteRune(']')
+				}
+				valueFuncs = append(valueFuncs, func() uint64 {
+					return metricValueFunc(fieldValues...)
+				})
+				numEntries++
+			}
 		}
 		if opts.Lossy {
 			columnHeaders.WriteString("\tChecksum")
@@ -187,7 +265,7 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 		return errors.New("profiling metrics have already been started")
 	}
 	s := snapshots{
-		numMetrics: numMetrics,
+		numEntries: numEntries,
 		ringbuffer: make([][]uint64, snapshotRingbufferSize),
 		// curWriterIndex is initialized to a valid index so that the
 		// collector cannot use up all indices before the writer even has
@@ -195,21 +273,32 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 		curWriterIndex: atomicbitops.FromInt32(snapshotRingbufferSize - 1),
 	}
 	for i := 0; i < snapshotRingbufferSize; i++ {
-		s.ringbuffer[i] = make([]uint64, snapshotBufferSize*(numMetrics+1))
+		s.ringbuffer[i] = make([]uint64, snapshotBufferSize*(numEntries+1))
 	}
 
+	// Truncate the underlying sink if possible to delete any past profiling
+	// data in the file, if any, as it makes no sense to concatenate them or
+	// to overwrite them in-place.
+	// We ignore errors here because the sink may not be truncatable,
+	// e.g. when it is pointing to the stdout FD.
+	_ = opts.Sink.Truncate(0)
+
 	stopProfilingMetrics = atomicbitops.FromBool(false)
-	doneProfilingMetrics = make(chan bool, 1)
+	doneProfilingMetrics = make(chan *CollectionStats, 1)
 	writeCh := make(chan writeReq, snapshotRingbufferSize)
 	s.startTime = time.Now().UnixNano()
 	cheapStartTime := CheapNowNano()
-	go collectProfilingMetrics(&s, values, cheapStartTime, opts.Rate, writeCh)
+	stats := CollectionStats{
+		CollectionRateNanos: uint64(opts.Rate.Nanoseconds()),
+		CheapStartNanos:     uint64(cheapStartTime),
+	}
+	go collectProfilingMetrics(&s, valueFuncs, cheapStartTime, opts.Rate, writeCh, &stats)
 	if opts.Lossy {
 		lossySink := newLossyBufferedWriter(opts.Sink)
-		go writeProfilingMetrics[*lossyBufferedWriter[T]](lossySink, &s, headers, writeCh)
+		go writeProfilingMetrics[*lossyBufferedWriter[T]](lossySink, &s, headers, writeCh, &stats)
 	} else {
 		bufferedSink := newBufferedWriter(opts.Sink)
-		go writeProfilingMetrics[*bufferedWriter[T]](bufferedSink, &s, headers, writeCh)
+		go writeProfilingMetrics[*bufferedWriter[T]](bufferedSink, &s, headers, writeCh, &stats)
 	}
 	log.Infof("Profiling metrics started.")
 
@@ -218,12 +307,16 @@ func StartProfilingMetrics[T ProfilingMetricsWriter](opts ProfilingMetricsOption
 
 // collectProfilingMetrics will send metrics to the writeCh until it receives a
 // signal via the stopProfilingMetrics channel.
-func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldValue) uint64, cheapStartTime int64, profilingRate time.Duration, writeCh chan<- writeReq) {
+func collectProfilingMetrics(s *snapshots, valueFuncs []valueFunc, cheapStartTime int64, profilingRate time.Duration, writeCh chan<- writeReq, stats *CollectionStats) {
 	defer close(writeCh)
 
-	numEntries := s.numMetrics + 1 // to account for the timestamp
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+
+	numEntries := s.numEntries + 1 // to account for the timestamp
 	ringbufferIdx := 0
 	curSnapshot := 0
+	var beforeCollectionTimestamp int64
 
 	// If we write faster than the writer can keep up, we back off.
 	// The backoff factor starts small but increases exponentially
@@ -242,27 +335,36 @@ func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldVa
 	)
 	backoffFactor := initialBackoffFactor
 
-	// To keep track of time cheaply, we use `CheapNowNano`.
-	// However, this can drift as it has poor precision.
-	// To get something more precise, we periodically call `time.Now`
-	// and `CheapNowNano` and use these two variables to track both.
-	// This way, we can compute a more precise time by using
-	// `CheapNowNano() - cheapTime + preciseTime`.
-	preciseTime := s.startTime
-	cheapTime := cheapStartTime
-
 	stopCollecting := false
-	for nextCollection := s.startTime; !stopCollecting; nextCollection += profilingRate.Nanoseconds() {
+	for nextCollection := cheapStartTime; !stopCollecting; nextCollection += profilingRate.Nanoseconds() {
+		if stopProfilingMetrics.Load() {
+			stopCollecting = true
+			stats.CheapLastCollectionNanos = uint64(nextCollection)
+			// Collect one last time before stopping.
+		}
 
-		// For small durations, just spin. Otherwise sleep.
+		// For small durations, just spin (and maybe yield). Otherwise sleep.
 		for {
 			const (
-				wakeUpNanos   = 10
-				spinMaxNanos  = 250
-				yieldMaxNanos = 1_000
+				// When the next collection time is closer than `spinMaxNanos` away,
+				// we will spin in place waiting for the collection time to come.
+				// If it is further away, see `yieldMaxNanos`.
+				spinMaxNanos = 50_000
+				// When the next collection time is closer than `yieldMaxNanos` away,
+				// we will continuously call `runtime.Gosched` until the collection
+				// time comes.
+				// If it is further away, we will call `time.Sleep` (but see
+				// `wakeUpNanos`).
+				// Look at your kernel's CONFIG_HZ configuration to see what a good
+				// lower bound for this value should be.
+				yieldMaxNanos = 2_500_000
+				// When we decide to call `time.Sleep`, `wakeUpNanos` is the amount of
+				// time to *undersleep* by passed to `time.Sleep`, such that we are
+				// likely to wake up a bit before the actual next collection time.
+				wakeUpNanos = 100_000
 			)
-			now := CheapNowNano() - cheapTime + preciseTime
-			nanosToNextCollection := nextCollection - now
+			beforeCollectionTimestamp = CheapNowNano()
+			nanosToNextCollection := nextCollection - beforeCollectionTimestamp
 			if nanosToNextCollection <= 0 {
 				// Collect now.
 				break
@@ -279,20 +381,18 @@ func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldVa
 			time.Sleep(time.Duration(nanosToNextCollection-wakeUpNanos) * time.Nanosecond)
 		}
 
-		if stopProfilingMetrics.Load() {
-			stopCollecting = true
-			// Collect one last time before stopping.
-		}
-
-		collectStart := CheapNowNano() - cheapTime + preciseTime
-		timestamp := time.Duration(collectStart - s.startTime)
-		base := curSnapshot * numEntries
 		ringBuf := s.ringbuffer[ringbufferIdx]
-		ringBuf[base] = uint64(timestamp)
+		base := curSnapshot * numEntries
 		for i := 1; i < numEntries; i++ {
-			ringBuf[base+i] = values[i-1]()
+			ringBuf[base+i] = valueFuncs[i-1]()
 		}
+		afterCollectionTimestamp := CheapNowNano()
+		middleCollectionTimestamp := (beforeCollectionTimestamp + afterCollectionTimestamp) / 2
+		ringBuf[base] = uint64(middleCollectionTimestamp - cheapStartTime)
 		curSnapshot++
+		stats.TotalSnapshots++
+		stats.TotalSleepTimingErrorNanos += uint64(max(nextCollection-beforeCollectionTimestamp, beforeCollectionTimestamp-nextCollection))
+		stats.TotalCollectionTimingErrorNanos += uint64(afterCollectionTimestamp - beforeCollectionTimestamp)
 
 		if curSnapshot == snapshotBufferSize {
 			writeCh <- writeReq{ringbufferIdx: ringbufferIdx, numLines: curSnapshot}
@@ -303,12 +403,11 @@ func collectProfilingMetrics(s *snapshots, values []func(fieldValues ...*FieldVa
 				// Going too fast, stop collecting for a bit.
 				backoffSleep := profilingRate * time.Duration(backoffFactor)
 				log.Warningf("Profiling metrics collector exhausted the entire ringbuffer... backing off for %v to let writer catch up.", backoffSleep)
+				stats.NumBackoffSleeps++
+				stats.TotalBackoffSleepNanos += uint64(backoffSleep.Nanoseconds())
 				time.Sleep(backoffSleep)
 				backoffFactor = min(backoffFactor*backoffFactorGrowth, backoffFactorMax)
 			}
-			// Refresh precise time.
-			preciseTime = time.Now().UnixNano()
-			cheapTime = CheapNowNano()
 		}
 	}
 	if curSnapshot != 0 {
@@ -358,6 +457,11 @@ func newBufferedWriter[T ProfilingMetricsWriter](underlying T) *bufferedWriter[T
 	return w
 }
 
+// Write implements bufferedMetricsWriter.Write.
+func (w *bufferedWriter[T]) Write(s []byte) (int, error) {
+	return w.buf.Write(s)
+}
+
 // WriteString implements bufferedMetricsWriter.WriteString.
 func (w *bufferedWriter[T]) WriteString(s string) (int, error) {
 	return w.buf.WriteString(s)
@@ -375,6 +479,11 @@ func (w *bufferedWriter[T]) NewLine() {
 func (w *bufferedWriter[T]) Flush() {
 	w.underlying.WriteString(w.buf.String())
 	w.buf.Reset()
+}
+
+// Truncate implements bufferedMetricsWriter.Truncate.
+func (w *bufferedWriter[T]) Truncate(size int64) error {
+	return w.underlying.Truncate(size)
 }
 
 // Close implements bufferedMetricsWriter.Close.
@@ -420,6 +529,11 @@ func newLossyBufferedWriter[T ProfilingMetricsWriter](underlying T) *lossyBuffer
 
 	w.flushBuf.WriteString("\n")
 	return w
+}
+
+// Write implements bufferedMetricsWriter.Write.
+func (w *lossyBufferedWriter[T]) Write(s []byte) (int, error) {
+	return w.lineBuf.Write(s)
 }
 
 // WriteString implements bufferedMetricsWriter.WriteString.
@@ -479,6 +593,11 @@ func (w *lossyBufferedWriter[T]) NewLine() {
 	}
 }
 
+// Truncate implements bufferedMetricsWriter.Truncate.
+func (w *lossyBufferedWriter[T]) Truncate(size int64) error {
+	return w.underlying.Truncate(size)
+}
+
 // Close implements bufferedMetricsWriter.Close.
 // It writes the checksum of the data written to the underlying writer.
 func (w *lossyBufferedWriter[T]) Close() error {
@@ -497,8 +616,8 @@ func (w *lossyBufferedWriter[T]) Close() error {
 
 // writeProfilingMetrics will write to the ProfilingMetricsWriter on every
 // request via writeReqs, until writeReqs is closed.
-func writeProfilingMetrics[T bufferedMetricsWriter](sink T, s *snapshots, headers []string, writeReqs <-chan writeReq) {
-	numEntries := s.numMetrics + 1
+func writeProfilingMetrics[T bufferedMetricsWriter](sink T, s *snapshots, headers []string, writeReqs <-chan writeReq, stats *CollectionStats) {
+	numEntries := s.numEntries + 1
 	for _, header := range headers {
 		sink.WriteString(header)
 		sink.NewLine()
@@ -518,11 +637,100 @@ func writeProfilingMetrics[T bufferedMetricsWriter](sink T, s *snapshots, header
 			sink.NewLine()
 		}
 	}
+	sink.WriteString(MetricsStatsIndicator)
+	stats.WriteTo(sink)
+	sink.NewLine()
 	sink.Close()
 
-	doneProfilingMetrics <- true
+	doneProfilingMetrics <- stats
 	close(doneProfilingMetrics)
 	profilingMetricsStarted.Store(false)
+}
+
+// Log logs some statistics about the profiling metrics collection process.
+func (s *CollectionStats) Log(infoFn func(format string, val ...any), warningFn func(format string, val ...any)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	captureDuration := time.Duration(s.CheapLastCollectionNanos-s.CheapStartNanos) * time.Nanosecond
+	collectionRate := time.Duration(s.CollectionRateNanos) * time.Nanosecond
+	totalSleepTimingError := time.Duration(s.TotalSleepTimingErrorNanos) * time.Nanosecond
+	totalCollectionTimingError := time.Duration(s.TotalCollectionTimingErrorNanos) * time.Nanosecond
+	totalBackoffSleep := time.Duration(s.TotalBackoffSleepNanos) * time.Nanosecond
+
+	expectedSnapshots := uint64(captureDuration / collectionRate)
+	if s.TotalSnapshots == expectedSnapshots+1 {
+		// Depending on the timing of when the stop signal was sent, the
+		// collection goroutine is expected to do an extra collection cycle,
+		// so we add one to the expected number of snapshots here to make it not
+		// look like the capture rate is >100%.
+		expectedSnapshots = s.TotalSnapshots
+	}
+	captureRate := 0.0
+	if expectedSnapshots > 0 {
+		captureRate = float64(s.TotalSnapshots) / float64(expectedSnapshots)
+	}
+	if captureRate < .99 {
+		warningFn("Captured %d snapshots out of %d expected (%.2f%% capture rate) over %v.", s.TotalSnapshots, expectedSnapshots, captureRate*100.0, captureDuration)
+		warningFn("This indicates that the profiling metrics writer is not keeping up with the metrics collection rate.")
+		warningFn("Ensure that the profiling metrics log is stored on a fast storage device, or consider reducing the metric profiling rate.")
+	} else {
+		infoFn("Captured %d snapshots out of %d expected (%.2f%% capture rate) over %v. This is acceptable.", s.TotalSnapshots, expectedSnapshots, captureRate*100.0, captureDuration)
+	}
+	averageSleepTimingError := totalSleepTimingError / time.Duration(s.TotalSnapshots)
+	sleepTimingErrorVsRate := float64(averageSleepTimingError) / float64(collectionRate)
+	if sleepTimingErrorVsRate > .1 {
+		warningFn("Average sleep timing error is high: %v (%.2f%% of the collection interval).", averageSleepTimingError, sleepTimingErrorVsRate*100.0)
+		warningFn("This means the profiling metrics collector is not waking up at the correct time to collect the next snapshot.")
+		warningFn("This may mean that the CPU is overloaded (e.g. from other processes running on the same machine or from the workload itself taking up all the cores).")
+		warningFn("Consider using a slower profiling rate, removing other background processes, or tweaking the sleep consts in profiling_metric.go.")
+	} else {
+		infoFn("Average sleep timing error: %v (%.2f%% of the collection interval). This is acceptable.", averageSleepTimingError, sleepTimingErrorVsRate*100.0)
+	}
+	averageCollectionTimingError := totalCollectionTimingError / time.Duration(s.TotalSnapshots)
+	collectionTimingErrorVsRate := float64(averageCollectionTimingError) / float64(collectionRate)
+	if collectionTimingErrorVsRate > .1 {
+		warningFn("Average collection timing error is high: %v (%.2f%% of the collection interval).", averageCollectionTimingError, collectionTimingErrorVsRate*100.0)
+		warningFn("This means the time between getting the value of the first metric vs the last metric within a single collection cycle is a too large fraction of the profiling rate.")
+		warningFn("This means there is significant drift between the time a value is reported as having vs the time it was actually scraped, relative to the profiling interval.")
+		warningFn("Consider using a slower profiling rate or profiling fewer metrics at a time.")
+	} else {
+		infoFn("Average collection timing error: %v (%.2f%% of the collection interval). This is acceptable.", averageCollectionTimingError, collectionTimingErrorVsRate*100.0)
+	}
+	if s.NumBackoffSleeps > 0 {
+		ratioLostToBackoff := float64(totalBackoffSleep) / float64(captureDuration)
+		if ratioLostToBackoff > .05 {
+			warningFn("Backed off %d times due to slow writer; total %v spent in backoff sleep (%.2f%% of the capture duration).")
+			warningFn("This indicates that the profiling metrics writer is not keeping up with the metrics collection rate.")
+			warningFn("Ensure that the profiling metrics log is stored on a fast storage device, or consider reducing the metric profiling rate.")
+		} else {
+			infoFn("Backed off %d times due to slow writer; total %v spent in backoff sleep (%.2f%% of the capture duration). This is acceptable.", s.NumBackoffSleeps, totalBackoffSleep, ratioLostToBackoff*100.0)
+		}
+	}
+}
+
+// WriteTo writes the statistics about the profiling metrics collection process
+// to the given io.Writer.
+func (s *CollectionStats) WriteTo(w io.Writer) (int64, error) {
+	s.mu.Lock()
+	marshalled, err := json.Marshal(s)
+	s.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	n, err := w.Write(marshalled)
+	return int64(n), err
+}
+
+// ParseCollectionStats parses the profiling metrics collection stats from the
+// given line.
+func ParseCollectionStats(line string) (*CollectionStats, error) {
+	line = strings.TrimPrefix(line, MetricsStatsIndicator)
+	var stats CollectionStats
+	if err := json.Unmarshal([]byte(line), &stats); err != nil {
+		return nil, err
+	}
+	return &stats, nil
 }
 
 // StopProfilingMetrics stops the profiling metrics goroutines. Call to make sure
@@ -532,9 +740,16 @@ func StopProfilingMetrics() {
 	if !profilingMetricsStarted.Load() {
 		return
 	}
-	if stopProfilingMetrics.CompareAndSwap(false, true) {
-		<-doneProfilingMetrics
+	if !stopProfilingMetrics.CompareAndSwap(false, true) {
+		// If the CAS fails, this means the signal was already sent,
+		// so don't wait on doneProfilingMetrics.
+		return
 	}
-	// If the CAS fails, this means the signal was already sent,
-	// so don't wait on doneProfilingMetrics.
+	stats := <-doneProfilingMetrics
+	log.Infof("Profiling metrics stopped.")
+	stats.Log(func(format string, val ...any) {
+		log.Infof("Profiling metrics: "+format, val...)
+	}, func(format string, val ...any) {
+		log.Warningf("Profiling metrics: "+format, val...)
+	})
 }

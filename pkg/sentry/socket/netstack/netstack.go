@@ -29,7 +29,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"reflect"
 	"time"
@@ -51,7 +50,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	epb "gvisor.dev/gvisor/pkg/sentry/socket/netstack/events_go_proto"
@@ -1108,6 +1107,10 @@ func getSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, family
 
 		v := primitive.Int32(ep.SocketOptions().GetRcvlowat())
 		return &v, nil
+	default:
+		if v, err, handled := getSockOptSocketCustom(t, s, ep, name, outLen); handled {
+			return v, err
+		}
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
@@ -2029,6 +2032,10 @@ func setSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		v := hostarch.ByteOrder.Uint32(optVal)
 		ep.SocketOptions().SetRcvlowat(int32(v))
 		return nil
+	default:
+		if err, handled := setSockOptSocketCustom(t, s, ep, name, optVal); handled {
+			return err
+		}
 	}
 
 	return nil
@@ -2625,6 +2632,8 @@ func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 			v = int32(tcpip.PMTUDiscoveryDo)
 		case linux.IP_PMTUDISC_PROBE:
 			v = int32(tcpip.PMTUDiscoveryProbe)
+		case linux.IP_PMTUDISC_INTERFACE, linux.IP_PMTUDISC_OMIT:
+			return nil // Noop.
 		default:
 			return syserr.ErrNotSupported
 		}
@@ -2743,7 +2752,7 @@ func (s *sock) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek
 
 	if !isPacket && trunc {
 		w = &tcpip.LimitedWriter{
-			W: ioutil.Discard,
+			W: io.Discard,
 			N: dst.NumBytes(),
 		}
 		res, err = s.Endpoint.Read(w, readOptions)
