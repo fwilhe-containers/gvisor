@@ -698,12 +698,14 @@ func Init() {
 		// branch at 535.113.01.
 		v535_183_01 := addDriverABI(535, 183, 01, "f6707afbdda9407e3cbc2e5128e60bcbcdbf02fae29958c72fafb5d405e8b883", v535_113_01)
 		v535_183_06 := addDriverABI(535, 183, 06, "c7bb0a0569c5347845479ed4e3e4d885c6ee3b8adf068c3401cdf754d5ba3d3b", v535_183_01)
-		_ = addDriverABI(535, 216, 01, "5ddea1147810012e33967c3181341bcd6624bd3d654c63f845df833b4ece6af7", v535_183_06)
+		v535_216_01 := addDriverABI(535, 216, 01, "5ddea1147810012e33967c3181341bcd6624bd3d654c63f845df833b4ece6af7", v535_183_06)
+		_ = addDriverABI(535, 230, 02, "20cca9118083fcc8083158466e9cb2b616a7922206bcb7296b1fa5cc9af2e0fd", v535_216_01)
 
 		// 545.23.06 is an intermediate unqualified version from the main branch.
 		v545_23_06 := func() *driverABI {
 			abi := v535_113_01()
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO] = ctrlHandler(ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545], compUtil)
+			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_GPU_GET_ACTIVE_DEVICE_IDS] = ctrlHandler(rmControlSimple, compUtil)
 			abi.allocationClass[nvgpu.RM_USER_SHARED_DATA] = allocHandler(rmAllocSimple[nvgpu.NV00DE_ALLOC_PARAMETERS_V545], compUtil)
 			abi.allocationClass[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = allocHandler(rmAllocSimple[nvgpu.NV00FD_ALLOCATION_PARAMETERS_V545], compUtil)
 			abi.allocationClass[nvgpu.NV01_MEMORY_SYSTEM] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545], compUtil)
@@ -714,6 +716,7 @@ func Init() {
 			abi.getStructs = func() *driverABIStructs {
 				structs := prevStructs()
 				structs.controlStructs[nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO] = driverStructWithName(nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545{}, "NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS")
+				structs.controlStructs[nvgpu.NV0000_CTRL_CMD_GPU_GET_ACTIVE_DEVICE_IDS] = simpleDriverStruct("NV0000_CTRL_GPU_GET_ACTIVE_DEVICE_IDS_PARAMS")
 				structs.allocationStructs[nvgpu.RM_USER_SHARED_DATA] = driverStructWithName(nvgpu.NV00DE_ALLOC_PARAMETERS_V545{}, "NV00DE_ALLOC_PARAMETERS")
 				structs.allocationStructs[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = driverStructWithName(nvgpu.NV00FD_ALLOCATION_PARAMETERS_V545{}, "NV00FD_ALLOCATION_PARAMETERS")
 				structs.allocationStructs[nvgpu.NV01_MEMORY_SYSTEM] = driverStructWithName(nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{}, "NV_MEMORY_ALLOCATION_PARAMS")
@@ -835,7 +838,25 @@ func Init() {
 			return abi
 		}
 
-		_ = addDriverABI(560, 35, 03, "f2932c92fadd43c5b2341be453fc4f73f0ad7185c26bb7a43fbde81ae29f1fe3", v560_28_03)
+		v560_35_03 := addDriverABI(560, 35, 03, "f2932c92fadd43c5b2341be453fc4f73f0ad7185c26bb7a43fbde81ae29f1fe3", v560_28_03)
+		v565_57_01 := addDriverABI(565, 57, 01, "6eebe94e585e385e8804f5a74152df414887bf819cc21bd95b72acd0fb182c7a", v560_35_03)
+
+		_ = addDriverABI(570, 86, 15, "87709c19c7401243136bc0ec9e7f147c6803070a11449ae8f0819dee7963f76b", func() *driverABI {
+			abi := v565_57_01()
+			abi.allocationClass[nvgpu.TURING_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+
+			prevStructs := abi.getStructs
+			abi.getStructs = func() *driverABIStructs {
+				structs := prevStructs()
+				structs.allocationStructs[nvgpu.TURING_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				return structs
+			}
+			return abi
+		})
 	})
 }
 
