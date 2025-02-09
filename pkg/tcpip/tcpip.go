@@ -996,6 +996,13 @@ const (
 	// IPv6Checksum is used to request the stack to populate and validate the IPv6
 	// checksum for transport level headers.
 	IPv6Checksum
+
+	// PacketMMapVersionOption is used to set the packet mmap version.
+	PacketMMapVersionOption
+
+	// PacketMMapReserveOption is used to set the packet mmap reserved space
+	// between the aligned header and the payload.
+	PacketMMapReserveOption
 )
 
 const (

@@ -1819,6 +1819,8 @@ func (p *PacketMMapOpts) StateFields() []string {
 		"NICID",
 		"NetProto",
 		"PacketEndpoint",
+		"Version",
+		"Reserve",
 	}
 }
 
@@ -1836,6 +1838,8 @@ func (p *PacketMMapOpts) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(6, &p.NICID)
 	stateSinkObject.Save(7, &p.NetProto)
 	stateSinkObject.Save(8, &p.PacketEndpoint)
+	stateSinkObject.Save(9, &p.Version)
+	stateSinkObject.Save(10, &p.Reserve)
 }
 
 func (p *PacketMMapOpts) afterLoad(context.Context) {}
@@ -1851,6 +1855,8 @@ func (p *PacketMMapOpts) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(6, &p.NICID)
 	stateSourceObject.Load(7, &p.NetProto)
 	stateSourceObject.Load(8, &p.PacketEndpoint)
+	stateSourceObject.Load(9, &p.Version)
+	stateSourceObject.Load(10, &p.Reserve)
 }
 
 func (lifetimes *AddressLifetimes) StateTypeName() string {
